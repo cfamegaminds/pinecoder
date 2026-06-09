@@ -1,5 +1,5 @@
 //@version=5
-indicator('ICT Macros [LuxAlgo] PREMIUM V5.0 FINAL', overlay = true, max_lines_count = 500, max_labels_count = 100)
+indicator('ICT Macros [LuxAlgo] PREMIUM V5.1 FINAL', overlay = true, max_lines_count = 500, max_labels_count = 100)
 
 //─────────────────────────────────────────────────────────────────────────────
 // Settings
@@ -167,6 +167,7 @@ var macro mc09 = macro.new()
 // processMacro
 //─────────────────────────────────────────────────────────────────────────────
 processMacro(macro _mc, bool _m, int _msh, int _msm,
+             int _nextH, int _nextM,
              bool _mh, bool _ml, bool _mm, bool _me,
              string _mt, string _utc, bool _dst, int _tf_m,
              bool _alert, int _alertM, pivotPoint _p) =>
@@ -285,13 +286,15 @@ processMacro(macro _mc, bool _m, int _msh, int _msm,
                 _p.l1 := cachedMinL
             if not na(cachedMaxH) and _p.ht < _mc.t
                 _p.h1 := cachedMaxH                
-        // ── Extend lines — stop exactly at next same-slot macro open bar ──────
-        // When h==_msh and m==_msm the open-bar branch fires instead,
-        // so set_x2 is never called — lines freeze at the bar before.
-        else if _mc.t == _mc.t[1] and (h != _msh or m != _msm)
-            _mc.lnhe.set_x2(bi)
-            _mc.lnle.set_x2(bi)
-            _mc.lnme.set_x2(bi)
+        // ── Extend until next macro start ─────────────────────────────────────
+        else if _mc.t == _mc.t[1]
+
+            bool stopExtension = (h == _nextH and m == _nextM)
+
+            if not stopExtension
+                _mc.lnhe.set_x2(bi)
+                _mc.lnle.set_x2(bi)
+                _mc.lnme.set_x2(bi)
 
         // ── Classify — runs once via bool flag ───────────────────────────────
         if bi == _mc.x2 + 1 and not _mc.classified
@@ -340,9 +343,9 @@ processMacro(macro _mc, bool _m, int _msh, int _msm,
 // Execute
 //─────────────────────────────────────────────────────────────────────────────
 if tf_m <= 5
-    processMacro(mc04, m04030430,  9,  3, m04_top, m04_bot, m04_mid, m04_ext, '04:05 AM - 04:20', '(UTC+00:00) LONDON',   lnSummerTime, tf_m, mcAlert, mcAlertM, p)
-    processMacro(mc08, m08500910,  8, 50, m08_top, m08_bot, m08_mid, m08_ext, '08:55 AM - 09:10', '(UTC-05:00) NEW YORK', nySummerTime, tf_m, mcAlert, mcAlertM, p)
-    processMacro(mc09, m09501010,  9, 50, m09_top, m09_bot, m09_mid, m09_ext, '09:55 AM - 10:10', '(UTC-05:00) NEW YORK', nySummerTime, tf_m, mcAlert, mcAlertM, p)
+    processMacro(mc04, m04030430,  9,  3, 8, 50, m04_top, m04_bot, m04_mid, m04_ext, '04:05 AM - 04:20', '(UTC+00:00) LONDON',   lnSummerTime, tf_m, mcAlert, mcAlertM, p)
+    processMacro(mc08, m08500910,  8, 50, 9, 50, m08_top, m08_bot, m08_mid, m08_ext, '08:55 AM - 09:10', '(UTC-05:00) NEW YORK', nySummerTime, tf_m, mcAlert, mcAlertM, p)
+    processMacro(mc09, m09501010,  9, 50, 9, 3, m09_top, m09_bot, m09_mid, m09_ext, '09:55 AM - 10:10', '(UTC-05:00) NEW YORK', nySummerTime, tf_m, mcAlert, mcAlertM, p)
 else
     var table note = table.new(position.bottom_right, 1, 1)
     if barstate.islast

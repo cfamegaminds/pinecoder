@@ -1,0 +1,349 @@
+//@version=5
+indicator('ICT Macros [LuxAlgo] PREMIUM V5.0 FINAL', overlay = true, max_lines_count = 500, max_labels_count = 100)
+
+//─────────────────────────────────────────────────────────────────────────────
+// Settings
+//─────────────────────────────────────────────────────────────────────────────
+group_ln     = 'London Time Settings'
+lnSummerTime = input.bool(true, 'London DST', group = group_ln)
+
+group_m04 = 'London 04:05 AM 04:20 Macro'
+m04030430 = input.bool(true, '04:05 AM 04:20', group = group_m04)
+m04_top   = input.bool(true, 'Top Line',        inline = 'mc04', group = group_m04)
+m04_mid   = input.bool(true, 'Mid Line',        inline = 'mc04', group = group_m04)
+m04_bot   = input.bool(true, 'Bottom Line',     inline = 'mc04', group = group_m04)
+m04_ext   = input.bool(true, 'Extending Lines', inline = 'mc04', group = group_m04)
+
+group_ny     = 'New York Time Settings'
+nySummerTime = input.bool(true, 'New York DST', group = group_ny)
+
+group_m08 = 'New York 08:55 AM 09:10 Macro'
+m08500910 = input.bool(true, '08:55 AM 09:10', group = group_m08)
+m08_top   = input.bool(true, 'Top Line',        inline = 'mc08', group = group_m08)
+m08_mid   = input.bool(true, 'Mid Line',        inline = 'mc08', group = group_m08)
+m08_bot   = input.bool(true, 'Bottom Line',     inline = 'mc08', group = group_m08)
+m08_ext   = input.bool(true, 'Extending Lines', inline = 'mc08', group = group_m08)
+
+group_m09 = 'New York 09:55 AM 10:10 Macro'
+m09501010 = input.bool(true, '09:55 AM 10:10', group = group_m09)
+m09_top   = input.bool(true, 'Top Line',        inline = 'mc09', group = group_m09)
+m09_mid   = input.bool(true, 'Mid Line',        inline = 'mc09', group = group_m09)
+m09_bot   = input.bool(true, 'Bottom Line',     inline = 'mc09', group = group_m09)
+m09_ext   = input.bool(true, 'Extending Lines', inline = 'mc09', group = group_m09)
+
+group_c = 'Macro Classification'
+pLen    = input.int(30, 'Length', minval = 5, maxval = 60, group = group_c)
+pLoc    = input.string('Body', 'Swing Area', options = ['Wick', 'Body'], group = group_c)
+
+aColor  = input.color(color.black,            'Accumulation', group = group_c)
+mColor  = input.color(color.rgb(255, 82, 82), 'Manipulation', group = group_c)
+eColor  = input.color(color.blue,             'Expansion',    group = group_c)
+
+mcText = input.string('Small', 'Macro Texts', options = ['Tiny', 'Small', 'Normal', 'None'])
+mcSize = switch mcText
+    'Tiny'   => size.tiny
+    'Small'  => size.small
+    'Normal' => size.normal
+    => size.tiny
+
+mcAlert  = input.bool(true, 'Alert Macro Times in Advance (Minutes)', inline = 'alert')
+mcAlertM = input.int(30, '', minval = 5, maxval = 60, step = 5, inline = 'alert')
+
+//─────────────────────────────────────────────────────────────────────────────
+// UDTs
+//─────────────────────────────────────────────────────────────────────────────
+type bar
+    float o = open
+    float h = high
+    float l = low
+    float c = close
+    int   t = time
+
+type macro
+    int      t
+    int      x2
+    int      len
+    float    o
+    float    top
+    float    bottom
+    float    mid
+    float    co
+    float    ch
+    float    cl
+    float    cc
+    line     lnh
+    line     lnhe
+    line     lnl
+    line     lnle
+    line     lnm
+    line     lnme
+    line     lnf
+    linefill lf
+    label    lb
+    bool     classified
+    color    col   = chart.fg_color
+    color    nocol = chart.bg_color
+
+type pivotPoint
+    int   ht
+    int   lt
+    float h
+    float h1
+    float l
+    float l1
+
+//─────────────────────────────────────────────────────────────────────────────
+// Helpers
+//─────────────────────────────────────────────────────────────────────────────
+method set_y(line _ln, float _y) =>
+    _ln.set_y1(_y)
+    _ln.set_y2(_y)
+
+f_getBarTime(string _utc, bool _dst, array<string> _utcCity, array<float> _utcOff, int _inAd, int _tf_m) =>
+    utcTime = (array.get(_utcOff, array.indexof(_utcCity, _utc)) + (_dst ? 1 : 0)) * 3600000 + _inAd * 60000 + time
+    h       = math.floor(utcTime / 3600000) % 24
+    m       = math.floor(utcTime / 60000)   % 60
+    int idx = 0
+    if _tf_m == 3
+        if m == 48
+            m   := m + 2
+            idx := 2
+        else if m == 9
+            m   := m + 1
+            idx := 1
+    else if _tf_m == 5
+        if (m == 0 and h == 9) or (m == 30 and h == 7)
+            m   := m + 3
+            idx := 3
+    [idx, h, m]
+
+f_getPivotPoint(int _len, string _loc) =>
+    ph = ta.pivothigh(_len, _len)
+    if ph and _loc == 'Body'
+        ph := math.max(open[_len], close[_len])
+    pl = ta.pivotlow(_len, _len)
+    if pl and _loc == 'Body'
+        pl := math.min(open[_len], close[_len])
+    pht = ph ? time[_len] : na
+    plt = pl ? time[_len] : na
+    [ph, pl, pht, plt]
+
+//─────────────────────────────────────────────────────────────────────────────
+// Main variables
+//─────────────────────────────────────────────────────────────────────────────
+tf_m = timeframe.multiplier
+bi   = bar_index
+
+var array<string> a_utcCity   = array.from('(UTC-05:00) NEW YORK', '(UTC+00:00) LONDON')
+var array<float>  a_utcOffset = array.from(-5.0, 0.0)
+
+ltfB = request.security_lower_tf(syminfo.tickerid, '1', bar.new())
+
+[a_pH, a_pL, a_pHt, a_pLt] = request.security_lower_tf(syminfo.tickerid, '1', f_getPivotPoint(pLen, pLoc))
+
+float cachedMinL  = array.size(a_pL)  > 0 ? array.min(a_pL)  : na
+float cachedMaxH  = array.size(a_pH)  > 0 ? array.max(a_pH)  : na
+int   cachedMinLt = array.size(a_pLt) > 0 ? int(array.min(a_pLt)) : na
+int   cachedMaxHt = array.size(a_pHt) > 0 ? int(array.max(a_pHt)) : na
+
+var pivotPoint p = pivotPoint.new()
+
+if not na(cachedMinL)
+    p.l  := cachedMinL
+    p.lt := cachedMinLt
+
+if not na(cachedMaxH)
+    p.h  := cachedMaxH
+    p.ht := cachedMaxHt
+
+//─────────────────────────────────────────────────────────────────────────────
+// Three dedicated macro instances — no shared mutation
+//─────────────────────────────────────────────────────────────────────────────
+var macro mc04 = macro.new()
+var macro mc08 = macro.new()
+var macro mc09 = macro.new()
+
+//─────────────────────────────────────────────────────────────────────────────
+// processMacro
+//─────────────────────────────────────────────────────────────────────────────
+processMacro(macro _mc, bool _m, int _msh, int _msm,
+             bool _mh, bool _ml, bool _mm, bool _me,
+             string _mt, string _utc, bool _dst, int _tf_m,
+             bool _alert, int _alertM, pivotPoint _p) =>
+
+    if _m
+
+        [idx, h, m] = f_getBarTime(_utc, _dst, a_utcCity, a_utcOffset, 0, _tf_m)
+
+        // ── Alert look-ahead ─────────────────────────────────────────────────
+        if _alert
+            [_, ha, ma] = f_getBarTime(_utc, _dst, a_utcCity, a_utcOffset, _alertM, _tf_m)
+            if ha == _msh and ma == _msm
+                alert(_mt + ' macro in ' + str.tostring(_alertM) + ' min — ' + syminfo.ticker)
+                _mc.lnf := line.new(time + _alertM * 60000, high, time + _alertM * 60000, low, xloc.bar_time, extend.both, _mc.col, line.style_solid, 1)
+
+        // ── Macro open bar ───────────────────────────────────────────────────
+        if h == _msh and m == _msm
+            _mc.lnf.delete()
+            _mc.classified := false
+
+            macroLen = (h == 8 or h == 9 or h == 10 or h == 11) ? (m == 3 ? 27 : 20) : (h == 7 ? 27 : 30)
+            _mc.len  := macroLen
+
+            if array.size(ltfB) > idx and not na(ltfB.get(idx).h)
+                _mc.t      := ltfB.get(idx).t
+                _mc.o      := ltfB.get(idx).o
+                _mc.top    := ltfB.get(idx).h
+                _mc.bottom := ltfB.get(idx).l
+
+            _mc.x2 := bi + math.round(_mc.len / _tf_m) + (idx == 0 ? 0 : 1)
+
+            _mc.lnh  := line.new(bi,     _mc.top,    _mc.x2, _mc.top,
+                                 color = _mh ? _mc.col : _mc.nocol,
+                                 style = line.style_solid, width = 2)
+            _mc.lnhe := line.new(_mc.x2, _mc.top,    _mc.x2, _mc.top,
+                                 color = (_me and _mh) ? _mc.col : _mc.nocol,
+                                 style = line.style_dotted, width = 2)
+            _mc.lnl  := line.new(bi,     _mc.bottom, _mc.x2, _mc.bottom,
+                                 color = _ml ? _mc.col : _mc.nocol,
+                                 style = line.style_solid, width = 2)
+            _mc.lnle := line.new(_mc.x2, _mc.bottom, _mc.x2, _mc.bottom,
+                                 color = (_me and _ml) ? _mc.col : _mc.nocol,
+                                 style = line.style_dotted, width = 2)
+            _mc.lnm  := line.new(bi,     math.avg(_mc.top, _mc.bottom),
+                                 _mc.x2, math.avg(_mc.top, _mc.bottom),
+                                 color = _mm ? _mc.col : _mc.nocol,
+                                 style = line.style_dotted, width = 1)
+            _mc.lnme := line.new(_mc.x2, math.avg(_mc.top, _mc.bottom),
+                                 _mc.x2, math.avg(_mc.top, _mc.bottom),
+                                 color = (_me and _mm) ? _mc.col : _mc.nocol,
+                                 style = line.style_dotted, width = 1)
+            _mc.lf   := linefill.new(_mc.lnh, _mc.lnl, color.new(color.gray, 100))
+            _mc.lb   := label.new(bi + int(_mc.len / _tf_m / 2), _mc.top,
+                                  mcText != 'None' ? 'MACRO\n' + _mt : '',
+                                  xloc.bar_index, yloc.price, #00000000,
+                                  label.style_label_down, chart.fg_color, mcSize, text.align_left)
+            _p.l1 := _p.l
+            _p.h1 := _p.h
+
+        // ── Inside macro window — update only when range expands ─────────────
+        else if bi < _mc.x2 and time >= _mc.t
+
+            newTop    = math.max(high, _mc.lnh.get_y1())
+            newBottom = math.min(low,  _mc.lnl.get_y1())
+            newMid    = math.avg(newTop, newBottom)
+
+            if newTop != _mc.top
+                _mc.top := newTop
+                _mc.lnh.set_y(_mc.top)
+                _mc.lnhe.set_y(_mc.top)
+                _mc.lb.set_y(math.max(high, _mc.lb.get_y()))
+
+            if newBottom != _mc.bottom
+                _mc.bottom := newBottom
+                _mc.lnl.set_y(_mc.bottom)
+                _mc.lnle.set_y(_mc.bottom)
+
+            if newMid != _mc.mid
+                _mc.mid := newMid
+                _mc.lnm.set_y(_mc.mid)
+                _mc.lnme.set_y(_mc.mid)
+
+            if not na(cachedMinL) and _p.lt < _mc.t
+                _p.l1 := cachedMinL
+            if not na(cachedMaxH) and _p.ht < _mc.t
+                _p.h1 := cachedMaxH
+
+        // ── Macro close bar ──────────────────────────────────────────────────
+        else if bi == _mc.x2
+
+            if array.size(ltfB) > idx and not na(ltfB.get(idx).c)
+                _mc.co := ltfB.get(idx).o
+                _mc.ch := ltfB.get(idx).h
+                _mc.cl := ltfB.get(idx).l
+                _mc.cc := ltfB.get(idx).c
+
+            newTop    = math.max(_mc.ch, _mc.lnh.get_y1())
+            newBottom = math.min(_mc.cl, _mc.lnl.get_y1())
+
+            if newTop != _mc.top
+                _mc.top := newTop
+                _mc.lnh.set_y(_mc.top)
+                _mc.lnhe.set_y(_mc.top)
+
+            if newBottom != _mc.bottom
+                _mc.bottom := newBottom
+                _mc.lnl.set_y(_mc.bottom)
+                _mc.lnle.set_y(_mc.bottom)
+
+            _mc.mid := math.avg(_mc.top, _mc.bottom)
+            _mc.lnm.set_y(_mc.mid)
+            _mc.lnme.set_y(_mc.mid)
+            _mc.lb.set_y(math.max(_mc.top, _mc.lb.get_y()))
+
+            if not na(cachedMinL) and _p.lt < _mc.t
+                _p.l1 := cachedMinL
+            if not na(cachedMaxH) and _p.ht < _mc.t
+                _p.h1 := cachedMaxH                
+        // ── Extend lines — stop exactly at next same-slot macro open bar ──────
+        // When h==_msh and m==_msm the open-bar branch fires instead,
+        // so set_x2 is never called — lines freeze at the bar before.
+        else if _mc.t == _mc.t[1] and (h != _msh or m != _msm)
+            _mc.lnhe.set_x2(bi)
+            _mc.lnle.set_x2(bi)
+            _mc.lnme.set_x2(bi)
+
+        // ── Classify — runs once via bool flag ───────────────────────────────
+        if bi == _mc.x2 + 1 and not _mc.classified
+            _mc.classified := true
+
+            _mc.lb.set_tooltip(
+              'mc open  : ' + str.tostring(_mc.o,       format.mintick) +
+              '\nmc close: ' + str.tostring(_mc.cc,     format.mintick) +
+              '\nmc top  : ' + str.tostring(_mc.top,    format.mintick) +
+              '\nmc mid  : ' + str.tostring(_mc.mid,    format.mintick) +
+              '\nmc bot  : ' + str.tostring(_mc.bottom, format.mintick))
+
+            topQ    = math.avg(_mc.top,    _mc.mid)
+            botQ    = math.avg(_mc.bottom, _mc.mid)
+            expOpen = (_mc.o < botQ and _mc.cc > topQ) or (_mc.o > topQ and _mc.cc < botQ)
+
+            label_prefix = ''
+            fill_color   = color.new(aColor, 50)
+
+            if _mc.bottom < _p.l1 and _mc.top > _p.h1
+                if expOpen
+                    label_prefix := 'Expansion '
+                    fill_color   := color.new(eColor, 60)
+                else
+                    label_prefix := 'Manipulation '
+                    fill_color   := color.new(mColor, 40)
+            else if _mc.bottom < _p.l1 or _mc.top > _p.h1
+                coExp = (_mc.co > _mc.mid and _mc.cc < _mc.mid) or (_mc.co < _mc.mid and _mc.cc > _mc.mid) or (_mc.o  < _mc.mid and _mc.cc < _mc.mid) or (_mc.o  > _mc.mid and _mc.cc > _mc.mid)
+                if coExp
+                    label_prefix := 'Accumulation '
+                else
+                    label_prefix := 'Expansion '
+                    fill_color   := color.new(eColor, 60)
+            else
+                if _p.l == _p.l1 and _p.h == _p.h1 and expOpen
+                    label_prefix := 'Expansion '
+                    fill_color   := color.new(eColor, 60)
+                else
+                    label_prefix := 'Accumulation '
+
+            _mc.lf.set_color(fill_color)
+            if mcText != 'None'
+                _mc.lb.set_text(label_prefix + 'MACRO\n' + _mt)
+
+//─────────────────────────────────────────────────────────────────────────────
+// Execute
+//─────────────────────────────────────────────────────────────────────────────
+if tf_m <= 5
+    processMacro(mc04, m04030430,  9,  3, m04_top, m04_bot, m04_mid, m04_ext, '04:05 AM - 04:20', '(UTC+00:00) LONDON',   lnSummerTime, tf_m, mcAlert, mcAlertM, p)
+    processMacro(mc08, m08500910,  8, 50, m08_top, m08_bot, m08_mid, m08_ext, '08:55 AM - 09:10', '(UTC-05:00) NEW YORK', nySummerTime, tf_m, mcAlert, mcAlertM, p)
+    processMacro(mc09, m09501010,  9, 50, m09_top, m09_bot, m09_mid, m09_ext, '09:55 AM - 10:10', '(UTC-05:00) NEW YORK', nySummerTime, tf_m, mcAlert, mcAlertM, p)
+else
+    var table note = table.new(position.bottom_right, 1, 1)
+    if barstate.islast
+        table.cell(note, 0, 0, 'ICT Macros: 1m / 3m / 5m only', text_size = size.small, text_color = chart.fg_color)

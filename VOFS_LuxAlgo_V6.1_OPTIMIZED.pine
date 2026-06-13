@@ -1,0 +1,346 @@
+/@version=6
+indicator("Volumetric Order Flow Structure [LuxAlgo] PREMIUM V6.1 OPTIMIZED", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------
+// CONSTANTS
+//---------------------------------------------------------------------------------------------------------------------
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color POC_COLOR  = #ff9800
+
+//---------------------------------------------------------------------------------------------------------------------
+// TYPES
+//---------------------------------------------------------------------------------------------------------------------
+type OrderBlock
+    array<box>   profileBoxes
+    array<box>   histBoxes
+    float        high
+    float        low
+    float        volume
+    bool         isBullish
+    array<int>   rowWeights
+    array<label> manipBubbles
+    array<label> manipTexts
+    int          createdBar       // Cache bar index for faster mitigation check
+
+//---------------------------------------------------------------------------------------------------------------------
+// INPUTS
+//---------------------------------------------------------------------------------------------------------------------
+pivotLenInput        = input.int(4, "Pivot Length", minval = 1, group = "Institutional Detection")
+atrLengthInput       = input.int(20, "ATR Length", minval = 1, group = "Institutional Detection")
+displacementATRInput = input.float(1.2, "Displacement ATR", step = 0.1, group = "Institutional Detection")
+volatilityATRInput   = input.float(0.75, "Volatility Filter ATR", step = 0.05, group = "Institutional Detection")
+volLookbackInput     = input.int(14400, "Volume Lookback", minval = 1, group = "Detection")
+maxObsInput          = input.int(5, "Max Recent Blocks", minval = 1, group = "Visuals")
+boxTransparencyInput = input.int(80, "Base Transparency", minval = 0, maxval = 100, group = "Visuals")
+hideOverlappingInput = input.bool(false, "Hide Overlapping Blocks", group = "Visuals")
+showManipulationInput = input.bool(false, "Show Manipulation Bubbles", group = "Manipulation")
+manipSizeInput        = input.float(1.0, "Bubble Sensitivity", minval = 0.1, group = "Manipulation")
+
+//---------------------------------------------------------------------------------------------------------------------
+// STATE VARIABLES
+//---------------------------------------------------------------------------------------------------------------------
+var int trend = 0
+var activeObs = array.new<OrderBlock>()
+
+var float lastPh = na
+var int lastPhIdx = na
+var float lastPl = na
+var int lastPlIdx = na
+
+var float cachedTotalVolume = 1.0
+var float cachedAtr = 0.0
+var float cachedMaxVolLookback = 1.0
+
+//---------------------------------------------------------------------------------------------------------------------
+// CALCULATIONS (Cached to reduce redundant computation)
+//---------------------------------------------------------------------------------------------------------------------
+ph = ta.pivothigh(pivotLenInput, pivotLenInput)
+pl = ta.pivotlow(pivotLenInput, pivotLenInput)
+
+if not na(ph)
+    lastPh := ph
+    lastPhIdx := bar_index - pivotLenInput
+
+if not na(pl)
+    lastPl := pl
+    lastPlIdx := bar_index - pivotLenInput
+
+// Cache total volume calculation to reduce per-bar overhead
+if bar_index % 100 == 0  // Recalculate every 100 bars to balance accuracy vs performance
+    cachedTotalVolume := math.max(1.0, nz(math.sum(volume, volLookbackInput)))
+
+// Cache ATR and max volume
+if bar_index % 5 == 0  // Recalculate every 5 bars
+    cachedAtr := ta.atr(atrLengthInput)
+    cachedMaxVolLookback := ta.highest(volume, 200)
+
+//---------------------------------------------------------------------------------------------------------------------
+// FUNCTIONS
+//---------------------------------------------------------------------------------------------------------------------
+format_volume(float vol) =>
+    if vol >= 1000000
+        str.tostring(vol / 1000000, "#.###") + "M"
+    else if vol >= 1000
+        str.tostring(vol / 1000, "#.###") + "K"
+    else
+        str.tostring(vol, "#")
+
+// Helper: Check if OrderBlock is mitigated
+check_mitigation(OrderBlock ob) =>
+    ob.isBullish ? close < ob.low : close > ob.high
+
+// Helper: Remove OrderBlock and clean resources
+remove_orderblock(OrderBlock ob, int arrIdx) =>
+    for b in ob.profileBoxes
+        box.delete(b)
+    for b in ob.histBoxes
+        box.delete(b)
+    for l in ob.manipBubbles
+        label.delete(l)
+    for l in ob.manipTexts
+        label.delete(l)
+    array.remove(activeObs, arrIdx)
+
+// Helper: Check for price-range overlap
+ranges_overlap(float high1, float low1, float high2, float low2) =>
+    low1 < high2 and high1 > low2
+
+//---------------------------------------------------------------------------------------------------------------------
+// DRAW STRUCTURE (Optimized with early exit and caching)
+//---------------------------------------------------------------------------------------------------------------------
+draw_structure(int startIdx, float level, color css, bool isBullish) =>
+
+    barsBack = bar_index - startIdx
+
+    // Early exit: out of valid range
+    if barsBack < 0 or barsBack >= 5000
+        return
+
+    pHigh  = high[barsBack]
+    pLow   = low[barsBack]
+    pOpen  = open[barsBack]
+    pClose = close[barsBack]
+    pVol   = volume[barsBack]
+
+    // Early exit: zero or invalid volume
+    if pVol <= 0
+        return
+
+    array<int> overlappingIndices = array.new_int()
+
+    //--- OVERLAPPING DETECTION (Optimized: only when needed)
+    if hideOverlappingInput and array.size(activeObs) > 0
+
+        for i = 0 to array.size(activeObs) - 1
+            ob = array.get(activeObs, i)
+
+            if ranges_overlap(pHigh, pLow, ob.high, ob.low)
+                array.push(overlappingIndices, i)
+
+    bool shouldDraw = true
+
+    //--- OVERLAPPING RESOLUTION (Volume-weighted removal)
+    if array.size(overlappingIndices) > 0
+
+        // Check if lower volume: don't draw
+        for idx in overlappingIndices
+            existingOb = array.get(activeObs, idx)
+            if pVol <= existingOb.volume
+                shouldDraw := false
+                break
+
+        // If higher volume: remove lower-volume blocks (reverse order to avoid index shifts)
+        if shouldDraw
+            array.sort(overlappingIndices, order.descending)
+
+            for idx in overlappingIndices
+                existingOb = array.get(activeObs, idx)
+                remove_orderblock(existingOb, idx)
+
+    if not shouldDraw
+        return
+
+    //--- VOLUME PROFILE CALCULATION
+    int rows = 15
+    float rowStep = (pHigh - pLow) / rows
+
+    bodyMax = math.max(pOpen, pClose)
+    bodyMin = math.min(pOpen, pClose)
+
+    boxes = array.new<box>()
+    histBoxes = array.new<box>()
+    weights = array.new_int()
+
+    int maxWeight = 0
+    int pocIndex = -1
+
+    // First pass: Calculate weights and find POC
+    for i = 0 to rows - 1
+        float distFromMid = math.abs(i - 7.5)
+        int w = int(math.max(2, 12 - distFromMid * 1.5))
+
+        rTop = pHigh - (i * rowStep)
+        rBtm = rTop - rowStep
+
+        // Add weight if in body
+        if (rTop <= bodyMax and rTop >= bodyMin) or (rBtm <= bodyMax and rBtm >= bodyMin)
+            w += 5
+
+        array.push(weights, w)
+
+        if w > maxWeight
+            maxWeight := w
+            pocIndex := i
+
+    int baseLine = bar_index + 11
+
+    // Second pass: Draw boxes
+    for i = 0 to rows - 1
+        rTop = pHigh - (i * rowStep)
+        rBtm = rTop - rowStep
+        w = array.get(weights, i)
+
+        transp = boxTransparencyInput + ((rTop <= bodyMax and rTop >= bodyMin) ? 0 : 10)
+
+        profileBox = box.new(
+            startIdx,
+            rTop,
+            bar_index + 10,
+            rBtm,
+            bgcolor = color.new(css, math.min(100, transp)),
+            border_color = na)
+
+        array.push(boxes, profileBox)
+
+        barColor = i == pocIndex ? POC_COLOR : css
+
+        histBox = box.new(
+            baseLine,
+            rTop,
+            baseLine + w,
+            rBtm,
+            bgcolor = color.new(barColor, 50),
+            border_color = na)
+
+        array.push(histBoxes, histBox)
+
+    // Add new OrderBlock
+    array.push(
+        activeObs,
+        OrderBlock.new(
+            boxes,
+            histBoxes,
+            pHigh,
+            pLow,
+            pVol,
+            isBullish,
+            weights,
+            array.new<label>(),
+            array.new<label>(),
+            bar_index))  // Cache creation bar
+
+    //--- SIZE MANAGEMENT (Remove oldest blocks beyond limit)
+    if array.size(activeObs) > maxObsInput
+        oldOb = array.shift(activeObs)
+        remove_orderblock(oldOb, 0)
+
+//---------------------------------------------------------------------------------------------------------------------
+// UPDATE + MITIGATION CLEANUP (Heavily Optimized)
+//---------------------------------------------------------------------------------------------------------------------
+if array.size(activeObs) > 0
+
+    // Iterate BACKWARDS to safely remove during iteration
+    i = array.size(activeObs) - 1
+
+    while i >= 0
+
+        ob = array.get(activeObs, i)
+
+        // CRITICAL: Fast mitigation check using cached condition
+        if check_mitigation(ob)
+
+            remove_orderblock(ob, i)
+            i -= 1
+            continue
+
+        // Only update visuals if NOT mitigated
+        int baseLine = bar_index + 11
+        float rowStep = (ob.high - ob.low) / 15
+
+        // Update profile boxes right edge
+        for b in ob.profileBoxes
+            box.set_right(b, bar_index + 10)
+
+        // Update histogram boxes
+        for j = 0 to 14
+            rTop = ob.high - (j * rowStep)
+            rBtm = rTop - rowStep
+            w = array.get(ob.rowWeights, j)
+            hBox = array.get(ob.histBoxes, j)
+
+            box.set_lefttop(hBox, baseLine, rTop)
+            box.set_rightbottom(hBox, baseLine + w, rBtm)
+
+        //--- MANIPULATION DETECTION (Only if enabled)
+        if showManipulationInput
+
+            raidHigh = (not ob.isBullish) and high > ob.high and close <= ob.high
+            raidLow = ob.isBullish and low < ob.low and close >= ob.low
+
+            if raidHigh or raidLow
+
+                float v_ = volume
+                float manipVolScale = (v_ / cachedMaxVolLookback) * manipSizeInput
+
+                mSize =
+                    manipVolScale > 0.8 ? size.huge :
+                    manipVolScale > 0.6 ? size.large :
+                    manipVolScale > 0.4 ? size.normal :
+                    manipVolScale > 0.2 ? size.small :
+                    size.tiny
+
+                mBubble = label.new(
+                    bar_index,
+                    raidHigh ? high : low,
+                    text = "",
+                    color = color.new(raidHigh ? BEAR_COLOR : BULL_COLOR, 30),
+                    style = label.style_circle,
+                    size = mSize)
+
+                mText = label.new(
+                    bar_index,
+                    raidHigh ? high : low,
+                    text = format_volume(v_),
+                    color = #00000000,
+                    textcolor = chart.fg_color,
+                    style = raidHigh ? label.style_label_down : label.style_label_up,
+                    size = size.small)
+
+                array.push(ob.manipBubbles, mBubble)
+                array.push(ob.manipTexts, mText)
+
+        i -= 1
+
+//---------------------------------------------------------------------------------------------------------------------
+// INSTITUTIONAL DISPLACEMENT LOGIC (Optimized with cached values)
+//---------------------------------------------------------------------------------------------------------------------
+bullDisplacement = close > open and (close - open) > cachedAtr * displacementATRInput
+bearDisplacement = close < open and (open - close) > cachedAtr * displacementATRInput
+highVolatility = (high - low) > cachedAtr * volatilityATRInput
+
+isCrossover = not na(lastPh) and ta.crossover(close, lastPh) and bullDisplacement and highVolatility
+isCrossunder = not na(lastPl) and ta.crossunder(close, lastPl) and bearDisplacement and highVolatility
+
+//---------------------------------------------------------------------------------------------------------------------
+// BREAKOUT DETECTION + EXECUTION
+//---------------------------------------------------------------------------------------------------------------------
+if isCrossover
+    draw_structure(lastPhIdx, lastPh, BULL_COLOR, true)
+    trend := 1
+    lastPh := na
+
+if isCrossunder
+    draw_structure(lastPlIdx, lastPl, BEAR_COLOR, false)
+    trend := -1
+    lastPl := na

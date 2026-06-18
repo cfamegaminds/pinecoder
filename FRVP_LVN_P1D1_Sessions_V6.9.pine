@@ -1,0 +1,811 @@
+//@version=6
+indicator(
+     "Fixed Range Volume Profile + LVN P1/D1 [3:30] PRO V6.9",
+     overlay = true,
+     max_lines_count = 500,
+     max_boxes_count = 500,
+     max_labels_count = 500,
+     max_bars_back = 5000
+)
+
+//=====================================================================
+// SETTINGS
+//=====================================================================
+
+rows = input.int(
+     120,
+     "Profile Rows",
+     minval = 10,
+     maxval = 180
+)
+
+profilesToShow = input.int(
+     15,
+     "Profiles To Plot",
+     minval = 1,
+     maxval = 50
+)
+
+pocWidth = input.int(
+     4,
+     "POC Width",
+     minval = 1,
+     maxval = 10
+)
+
+pocColor = input.color(
+     color.blue,
+     "POC Color"
+)
+
+extendIntoNext = input.bool(
+     true,
+     "Extend POC Across Next Session"
+)
+
+//=====================================================================
+// LVN SETTINGS
+//=====================================================================
+
+showLVN = input.bool(
+     true,
+     "Show LVN (Last Value Normal)"
+)
+
+lvnVAHColor = input.color(
+     color.new(color.lime, 30),
+     "LVN VAH Color"
+)
+
+lvnVALColor = input.color(
+     color.new(color.red, 30),
+     "LVN VAL Color"
+)
+
+lvnP1Color = input.color(
+     color.new(color.green, 40),
+     "LVN P1 Color"
+)
+
+lvnD1Color = input.color(
+     color.new(color.orange, 40),
+     "LVN D1 Color"
+)
+
+lvnWidth = input.int(
+     2,
+     "LVN Line Width",
+     minval = 1,
+     maxval = 5
+)
+
+showLVNLabels = input.bool(
+     true,
+     "Show LVN Labels"
+)
+
+daysBack = input.int(
+     7,
+     "Days Back for LVN P1/D1",
+     minval = 1,
+     maxval = 30
+)
+
+//=====================================================================
+// SESSION SETTINGS
+//=====================================================================
+
+string tz = "Asia/Kolkata"
+
+sessHour   = 3
+sessMinute = 30
+
+curHour = hour(time, tz)
+curMin  = minute(time, tz)
+
+// Session starts at 03:30 IST
+newSession =
+     (curHour == sessHour and curMin == sessMinute)
+
+//=====================================================================
+// ARRAYS
+//=====================================================================
+
+var int[]  sessionStarts = array.new_int()
+var int[]  sessionEnds   = array.new_int()
+
+var line[]  pocLines   = array.new_line()
+var line[]  lvnLines   = array.new_line()
+var label[] allLabels  = array.new_label()
+
+// LVN P1/D1 Storage per session
+var float[] lvnP1Array = array.new_float()
+var float[] lvnD1Array = array.new_float()
+var int[]   lvnSessionStarts = array.new_int()
+var int[]   lvnSessionEnds = array.new_int()
+
+var float developingVAH = na
+var float developingVAL = na
+var float lvnVAH = na
+var float lvnVAL = na
+
+int currentSessionStart = na
+
+float tmpPOC = na
+
+float tmpVAH = na
+
+float tmpVAL = na
+
+//=====================================================================
+// SESSION DETECTION
+//=====================================================================
+
+if newSession
+
+    // Close previous session
+    if array.size(sessionStarts) > array.size(sessionEnds)
+
+        previousEnd = bar_index - 1
+
+        array.push(
+             sessionEnds,
+             previousEnd
+        )
+
+    // Start new session
+    array.push(
+         sessionStarts,
+         bar_index
+    )
+
+    // Keep memory controlled
+    while array.size(sessionStarts) > profilesToShow + 1
+        array.shift(sessionStarts)
+
+    while array.size(sessionEnds) > profilesToShow
+        array.shift(sessionEnds)
+
+//=====================================================================
+// PROFILE FUNCTION
+// RETURNS:
+// [POC, VAH, VAL]
+//=====================================================================
+
+calcProfileLevels(_startBar, _endBar, _rows) =>
+
+    float hi = na
+    float lo = na
+
+    safeStart =
+         math.max(
+             _startBar,
+             bar_index - 4999
+         )
+
+    //---------------------------------------------------------
+    // HIGH / LOW
+    //---------------------------------------------------------
+
+    for i = safeStart to _endBar
+
+        barsBack = bar_index - i
+
+        if barsBack >= 0 and barsBack < 5000
+
+            hi :=
+                 na(hi)
+                 ? high[barsBack]
+                 : math.max(hi, high[barsBack])
+
+            lo :=
+                 na(lo)
+                 ? low[barsBack]
+                 : math.min(lo, low[barsBack])
+
+    if na(hi) or na(lo)
+
+        [na, na, na]
+
+    else
+
+        float myRange =
+             math.max(
+                 hi - lo,
+                 syminfo.mintick
+             )
+
+        step = myRange / _rows
+
+        float[] volumeRows =
+             array.new_float(_rows, 0.0)
+
+        totalVol = 0.0
+
+        //-----------------------------------------------------
+        // DISTRIBUTE VOLUME
+        //-----------------------------------------------------
+
+        for i = safeStart to _endBar
+
+            barsBack = bar_index - i
+
+            if barsBack >= 0 and barsBack < 5000
+
+                barHigh = high[barsBack]
+                barLow  = low[barsBack]
+                barVol  = volume[barsBack]
+
+                totalVol += barVol
+
+                barRange =
+                     math.max(
+                         barHigh - barLow,
+                         syminfo.mintick
+                     )
+
+                for r = 0 to _rows - 1
+
+                    rowLow  = lo + step * r
+                    rowHigh = rowLow + step
+
+                    overlap =
+                         math.max(
+                             math.min(barHigh, rowHigh) -
+                             math.max(barLow, rowLow),
+                             0
+                         )
+
+                    if overlap > 0
+
+                        volToAdd =
+                             barVol *
+                             (overlap / barRange)
+
+                        currentVol =
+                             array.get(volumeRows, r)
+
+                        array.set(
+                             volumeRows,
+                             r,
+                             currentVol + volToAdd
+                         )
+
+        //-----------------------------------------------------
+        // FIND POC
+        //-----------------------------------------------------
+
+        maxVol = 0.0
+        pocRow = 0
+
+        for r = 0 to _rows - 1
+
+            rowVol = array.get(volumeRows, r)
+
+            if rowVol > maxVol
+
+                maxVol := rowVol
+                pocRow := r
+
+        poc =
+             lo +
+             step * pocRow +
+             step * 0.5
+
+        //-----------------------------------------------------
+        // VALUE AREA
+        //-----------------------------------------------------
+
+        targetVol = totalVol * 0.79
+
+        currentVA = maxVol
+
+        vahRow = pocRow
+        valRow = pocRow
+
+        while currentVA < targetVol
+
+            upVol =
+                 vahRow < _rows - 1
+                 ? array.get(volumeRows, vahRow + 1)
+                 : 0
+
+            downVol =
+                 valRow > 0
+                 ? array.get(volumeRows, valRow - 1)
+                 : 0
+
+            if upVol >= downVol
+
+                vahRow += 1
+                currentVA += upVol
+
+            else
+
+                valRow -= 1
+                currentVA += downVol
+
+        vah =
+             lo +
+             step * vahRow +
+             step
+
+        val =
+             lo +
+             step * valRow
+
+        [poc, vah, val]
+
+//=====================================================================
+// TABLE
+//=====================================================================
+
+var table pdTable =
+     table.new(
+         position.bottom_left,
+         2,
+         7,
+         border_width = 2,
+         frame_color = color.white,
+         frame_width = 2
+     )
+
+//=====================================================================
+// DRAW EVERYTHING
+//=====================================================================
+
+if barstate.islast
+
+    //---------------------------------------------------------
+    // DELETE OLD LINES
+    //---------------------------------------------------------
+
+    if array.size(pocLines) > 0
+
+        for i = 0 to array.size(pocLines) - 1
+
+            line.delete(array.get(pocLines, i))
+
+    array.clear(pocLines)
+
+    //---------------------------------------------------------
+    // DELETE OLD LVN LINES
+    //---------------------------------------------------------
+
+    if array.size(lvnLines) > 0
+
+        for i = 0 to array.size(lvnLines) - 1
+
+            line.delete(array.get(lvnLines, i))
+
+    array.clear(lvnLines)
+
+    //---------------------------------------------------------
+    // DELETE OLD LABELS
+    //---------------------------------------------------------
+
+    if array.size(allLabels) > 0
+
+        for i = 0 to array.size(allLabels) - 1
+
+            label.delete(array.get(allLabels, i))
+
+    array.clear(allLabels)
+
+    //---------------------------------------------------------
+    // SESSION COUNT
+    //---------------------------------------------------------
+
+    sessionCount =
+         math.min(
+             array.size(sessionEnds),
+             profilesToShow
+         )
+
+    //---------------------------------------------------------
+    // DRAW SESSIONS
+    //---------------------------------------------------------
+
+    if sessionCount > 0
+
+        for s = 0 to sessionCount - 1
+
+            startBar =
+                 array.get(sessionStarts, s)
+
+            endBar =
+                 array.get(sessionEnds, s)
+
+            if endBar > startBar
+
+                [poc, vah, val] =
+                     calcProfileLevels(
+                         startBar,
+                         endBar,
+                         rows
+                     )
+
+                if not na(poc)
+
+                    startBack =
+                         bar_index - startBar
+
+                    endBack =
+                         bar_index - endBar
+
+                    if startBack >= 0 and
+                       startBack < 5000 and
+                       endBack >= 0 and
+                       endBack < 5000
+
+                        t1 = time[endBack]
+
+                        sessionBars =
+                             endBar - startBar
+
+                        extendBack =
+                             math.max(
+                                 endBack - sessionBars,
+                                 0
+                             )
+
+                        extendBack :=
+                             math.min(
+                                 extendBack,
+                                 4999
+                             )
+
+                        t2 =
+                             extendIntoNext
+                             ? time[extendBack]
+                             : t1
+
+                        //-------------------------------------------------
+                        // POC
+                        //-------------------------------------------------
+
+                        pocLine =
+                             line.new(
+                                 x1 = t1,
+                                 y1 = poc,
+                                 x2 = t2,
+                                 y2 = poc,
+                                 xloc = xloc.bar_time,
+                                 color = pocColor,
+                                 width = pocWidth
+                             )
+
+                        array.push(
+                             pocLines,
+                             pocLine
+                        )
+
+                        //-------------------------------------------------
+                        // VAH
+                        //-------------------------------------------------
+
+                        line.new(
+                             x1 = t1,
+                             y1 = vah,
+                             x2 = t2,
+                             y2 = vah,
+                             xloc = xloc.bar_time,
+                             color = color.green,
+                             width = 0
+                        )
+
+                        //-------------------------------------------------
+                        // VAL
+                        //-------------------------------------------------
+
+                        line.new(
+                             x1 = t1,
+                             y1 = val,
+                             x2 = t2,
+                             y2 = val,
+                             xloc = xloc.bar_time,
+                             color = color.red,
+                             width = 0
+                        )
+
+                        //-------------------------------------------------
+                        // PREMIUM / DISCOUNT
+                        //-------------------------------------------------
+
+                        x = vah - poc
+                        y = poc - val
+
+                        premium1 = poc + x
+                        discount1 = poc - y
+
+                        //-------------------------------------------------
+                        // P1 LINE
+                        //-------------------------------------------------
+
+                        line.new(
+                             x1 = t1,
+                             y1 = premium1,
+                             x2 = t2,
+                             y2 = premium1,
+                             xloc = xloc.bar_time,
+                             color = color.new(color.green, 40),
+                             width = 1,
+                             style = line.style_dashed
+                        )
+
+                        //-------------------------------------------------
+                        // D1 LINE
+                        //-------------------------------------------------
+
+                        line.new(
+                             x1 = t1,
+                             y1 = discount1,
+                             x2 = t2,
+                             y2 = discount1,
+                             xloc = xloc.bar_time,
+                             color = color.new(color.red, 40),
+                             width = 1,
+                             style = line.style_dashed
+                        )
+
+                        //-------------------------------------------------
+                        // P1 LABEL
+                        //-------------------------------------------------
+
+                        p1Label =
+                             label.new(
+                                 x = t2,
+                                 y = premium1,
+                                 text = "P1",
+                                 xloc = xloc.bar_time,
+                                 style = label.style_label_left,
+                                 textcolor = color.white,
+                                 color = color.green,
+                                 size = size.normal
+                             )
+
+                        array.push(
+                             allLabels,
+                             p1Label
+                        )
+
+                        //-------------------------------------------------
+                        // D1 LABEL
+                        //-------------------------------------------------
+
+                        d1Label =
+                             label.new(
+                                 x = t2,
+                                 y = discount1,
+                                 text = "D1",
+                                 xloc = xloc.bar_time,
+                                 style = label.style_label_left,
+                                 textcolor = color.white,
+                                 color = color.red,
+                                 size = size.normal
+                             )
+
+                        array.push(
+                             allLabels,
+                             d1Label
+                        )
+
+    //---------------------------------------------------------
+    // DRAW LVN P1/D1 LINES (7-day history)
+    //---------------------------------------------------------
+
+    if showLVN and array.size(lvnP1Array) > 0
+
+        lvnCount =
+             math.min(
+                 array.size(lvnP1Array),
+                 daysBack
+             )
+
+        for lv = 0 to lvnCount - 1
+
+            lvnP1Val = array.get(lvnP1Array, lv)
+            lvnD1Val = array.get(lvnD1Array, lv)
+            lvnStart = array.get(lvnSessionStarts, lv)
+            lvnEnd = array.get(lvnSessionEnds, lv)
+
+            if not na(lvnP1Val) and
+               not na(lvnD1Val) and
+               lvnEnd > lvnStart
+
+                startBack =
+                     bar_index - lvnStart
+
+                endBack =
+                     bar_index - lvnEnd
+
+                if startBack >= 0 and
+                   startBack < 5000 and
+                   endBack >= 0 and
+                   endBack < 5000
+
+                    t1_lvn = time[endBack]
+                    t2_lvn = time[startBack]
+
+                    //-------------------------------------------------
+                    // LVN P1 LINE
+                    //-------------------------------------------------
+
+                    lvnP1Line =
+                         line.new(
+                             x1 = t1_lvn,
+                             y1 = lvnP1Val,
+                             x2 = t2_lvn,
+                             y2 = lvnP1Val,
+                             xloc = xloc.bar_time,
+                             color = lvnP1Color,
+                             width = lvnWidth,
+                             style = line.style_dotted
+                        )
+
+                    array.push(lvnLines, lvnP1Line)
+
+                    //-------------------------------------------------
+                    // LVN D1 LINE
+                    //-------------------------------------------------
+
+                    lvnD1Line =
+                         line.new(
+                             x1 = t1_lvn,
+                             y1 = lvnD1Val,
+                             x2 = t2_lvn,
+                             y2 = lvnD1Val,
+                             xloc = xloc.bar_time,
+                             color = lvnD1Color,
+                             width = lvnWidth,
+                             style = line.style_dotted
+                        )
+
+                    array.push(lvnLines, lvnD1Line)
+
+                    //-------------------------------------------------
+                    // LVN P1 LABEL
+                    //-------------------------------------------------
+
+                    if showLVNLabels
+
+                        lvnP1Label =
+                             label.new(
+                                 x = t2_lvn,
+                                 y = lvnP1Val,
+                                 text = "LVN.P1",
+                                 xloc = xloc.bar_time,
+                                 style = label.style_label_left,
+                                 textcolor = color.white,
+                                 color = color.new(color.green, 50),
+                                 size = size.tiny
+                             )
+
+                        array.push(allLabels, lvnP1Label)
+
+                        //-------------------------------------------------
+                        // LVN D1 LABEL
+                        //-------------------------------------------------
+
+                        lvnD1Label =
+                             label.new(
+                                 x = t2_lvn,
+                                 y = lvnD1Val,
+                                 text = "LVN.D1",
+                                 xloc = xloc.bar_time,
+                                 style = label.style_label_left,
+                                 textcolor = color.white,
+                                 color = color.new(color.orange, 50),
+                                 size = size.tiny
+                             )
+
+                        array.push(allLabels, lvnD1Label)
+
+//=====================================================================
+// DEVELOPING VAH / VAL & STORE P1/D1
+//=====================================================================
+
+devSessionStart =
+     array.size(sessionStarts) > 0
+     ? array.get(sessionStarts, array.size(sessionStarts) - 1)
+     : na
+
+if not na(devSessionStart) and bar_index % 5 == 0
+
+    [tmpPOC, tmpVAH, tmpVAL] =
+         calcProfileLevels(
+             devSessionStart,
+             bar_index,
+             rows)
+
+    developingVAH := tmpVAH
+    developingVAL := tmpVAL
+    
+    // Update LVN (Last Value Normal) with latest developing values
+    lvnVAH := tmpVAH
+    lvnVAL := tmpVAL
+
+//=====================================================================
+// STORE COMPLETED SESSION P1/D1 VALUES
+//=====================================================================
+
+if array.size(sessionEnds) > array.size(lvnSessionEnds)
+
+    completedSessionIdx =
+         array.size(lvnSessionEnds)
+
+    startBar =
+         array.get(sessionStarts, completedSessionIdx)
+
+    endBar =
+         array.get(sessionEnds, completedSessionIdx)
+
+    if endBar > startBar
+
+        [poc, vah, val] =
+             calcProfileLevels(
+                 startBar,
+                 endBar,
+                 rows
+             )
+
+        if not na(poc)
+
+            x = vah - poc
+            y = poc - val
+
+            premium1 = poc + x
+            discount1 = poc - y
+
+            // Store P1/D1 for this session
+            array.push(lvnP1Array, premium1)
+            array.push(lvnD1Array, discount1)
+            array.push(lvnSessionStarts, startBar)
+            array.push(lvnSessionEnds, endBar)
+
+            // Keep only daysBack sessions
+            while array.size(lvnP1Array) > daysBack
+                array.shift(lvnP1Array)
+                array.shift(lvnD1Array)
+                array.shift(lvnSessionStarts)
+                array.shift(lvnSessionEnds)
+
+//=====================================================================
+// DEVELOPING VALUE AREA
+//=====================================================================
+
+plot(
+     developingVAH,
+     title     = "Developing VAH",
+     color     = color.lime,
+     linewidth = 2,
+     style     = plot.style_stepline
+)
+
+plot(
+     developingVAL,
+     title     = "Developing VAL",
+     color     = color.red,
+     linewidth = 2,
+     style     = plot.style_stepline
+)
+
+//=====================================================================
+// PLOT LVN VALUES (for debugging / chart values)
+//=====================================================================
+
+plot(
+     showLVN ? lvnVAH : na,
+     title     = "LVN VAH (Last Value)",
+     color     = color.new(color.lime, 50),
+     linewidth = 1,
+     display = display.none
+)
+
+plot(
+     showLVN ? lvnVAL : na,
+     title     = "LVN VAL (Last Value)",
+     color     = color.new(color.red, 50),
+     linewidth = 1,
+     display = display.none
+)

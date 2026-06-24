@@ -1,0 +1,676 @@
+/@version=6
+indicator(
+     "MTF DOM Candle Bias Box V3.0 - Institutional Confluence",
+     overlay = true,
+     max_boxes_count = 500,
+     max_lines_count = 500,
+     max_labels_count = 500
+)
+
+//=====================================================================
+// CORE SETTINGS
+//=====================================================================
+
+// Session settings
+string tz = "Asia/Kolkata"
+sessHour = 3
+sessMinute = 30
+
+// 15min DOM ratio thresholds (precise user specification)
+strongBullishRatio = input.float(
+     2.5,
+     "Strong Bullish Ratio Threshold",
+     minval = 2.0,
+     maxval = 4.0,
+     step = 0.1
+)
+
+neutralBullishRatioHigh = input.float(
+     2.5,
+     "Neutral Bullish Upper",
+     minval = 1.0,
+     maxval = 3.0,
+     step = 0.1
+)
+
+neutralBullishRatioLow = input.float(
+     1.5,
+     "Neutral Bullish Lower",
+     minval = 1.0,
+     maxval = 2.5,
+     step = 0.1
+)
+
+neutralRatioHigh = input.float(
+     1.5,
+     "Neutral Upper",
+     minval = 1.0,
+     maxval = 2.0,
+     step = 0.1
+)
+
+neutralRatioLow = input.float(
+     1.0,
+     "Neutral Lower",
+     minval = 0.5,
+     maxval = 1.5,
+     step = 0.1
+)
+
+neutralBearishRatioHigh = input.float(
+     1.0,
+     "Neutral Bearish Upper",
+     minval = 0.5,
+     maxval = 1.5,
+     step = 0.1
+)
+
+neutralBearishRatioLow = input.float(
+     0.75,
+     "Neutral Bearish Lower",
+     minval = 0.5,
+     maxval = 1.0,
+     step = 0.1
+)
+
+strongBearishRatio = input.float(
+     0.75,
+     "Strong Bearish Ratio Threshold",
+     minval = 0.1,
+     maxval = 1.0,
+     step = 0.1
+)
+
+//=====================================================================
+// WMA(1440) SETTINGS
+//=====================================================================
+
+wmaLength = input.int(
+     20,
+     "WMA(1440) Length",
+     minval = 5,
+     maxval = 50
+)
+
+wmaColor_Bullish = input.color(
+     color.new(color.green, 20),
+     "WMA Bullish Color"
+)
+
+wmaColor_Bearish = input.color(
+     color.new(color.red, 20),
+     "WMA Bearish Color"
+)
+
+showWMA = input.bool(
+     true,
+     "Show WMA(1440) Overlay"
+)
+
+//=====================================================================
+// LVNVAH / LVNVAL SETTINGS
+//=====================================================================
+
+// External source: connect to FRVP V8.1 indicator outputs
+lvnVAH_Input = input.source(
+     close,
+     "LVNVAH Source (from FRVP indicator)"
+)
+
+lvnVAL_Input = input.source(
+     close,
+     "LVNVAL Source (from FRVP indicator)"
+)
+
+// For direct calculation (if FRVP not available)
+calculateOwnLVN = input.bool(
+     false,
+     "Calculate LVN Internally (if FRVP unavailable)"
+)
+
+lvnRows = input.int(
+     80,
+     "LVN Calculation Rows",
+     minval = 20,
+     maxval = 180
+)
+
+showLVNLevels = input.bool(
+     true,
+     "Show Locked LVNVAH/LVNVAL Levels"
+)
+
+lvnResistanceColor = input.color(
+     color.new(color.red, 0),
+     "Locked Resistance (LVNVAH) Color"
+)
+
+lvnSupportColor = input.color(
+     color.new(color.green, 0),
+     "Locked Support (LVNVAL) Color"
+)
+
+//=====================================================================
+// DOM CANDLE SETTINGS
+//=====================================================================
+
+// Body color mapping
+bullishBodyColor = input.color(
+     color.new(color.green, 50),
+     "Bullish DOM Body Color"
+)
+
+bearishBodyColor = input.color(
+     color.new(color.red, 50),
+     "Bearish DOM Body Color"
+)
+
+neutralBodyColor = input.color(
+     color.new(color.gray, 50),
+     "Neutral DOM Body Color"
+)
+
+// Box sizing
+boxWidth = input.int(
+     2,
+     "DOM Box Width (bars)",
+     minval = 1,
+     maxval = 5
+)
+
+boxHeight = input.float(
+     0.3,
+     "DOM Box Height %",
+     minval = 0.1,
+     maxval = 1.0,
+     step = 0.1
+)
+
+//=====================================================================
+// CONFLUENCE & ALERT SETTINGS
+//=====================================================================
+
+showBiasBox = input.bool(
+     true,
+     "Show DOM Bias Boxes"
+)
+
+showConfluenceTable = input.bool(
+     true,
+     "Show Confluence Table"
+)
+
+showEntrySignals = input.bool(
+     true,
+     "Show Entry Alert Labels"
+)
+
+showAlerts = input.bool(
+     true,
+     "Enable Alert Messages"
+)
+
+alertOnStrongBullish = input.bool(
+     true,
+     "Alert on Strong Bullish (3/3)"
+)
+
+alertOnStrongBearish = input.bool(
+     true,
+     "Alert on Strong Bearish (3/3)"
+)
+
+//=====================================================================
+// STATE VARIABLES
+//=====================================================================
+
+var float lvnVAH_locked = na
+var float lvnVAL_locked = na
+var bool lvnVAH_isLocked = false
+var bool lvnVAL_isLocked = false
+
+var float wma1440 = na
+var string wmaDirection = "neutral"
+
+//=====================================================================
+// SESSION DETECTION
+//=====================================================================
+
+curHour = hour(time, tz)
+curMin = minute(time, tz)
+isSessionStart = (curHour == sessHour and curMin == sessMinute)
+
+// Reset LVN lock state on new session
+if isSessionStart
+    lvnVAH_locked := na
+    lvnVAL_locked := na
+    lvnVAH_isLocked := false
+    lvnVAL_isLocked := false
+
+//=====================================================================
+// WMA(1440) CALCULATION
+//=====================================================================
+
+// Fetch 1440-minute (daily) close
+dailyClose = request.security(syminfo.tickerid, "1440", close)
+dailyHigh = request.security(syminfo.tickerid, "1440", high)
+dailyLow = request.security(syminfo.tickerid, "1440", low)
+
+// Calculate WMA on daily timeframe
+wma1440 := ta.wma(dailyClose, wmaLength)
+
+// Determine WMA direction
+if wma1440 > wma1440[1]
+    wmaDirection := "bullish"
+else if wma1440 < wma1440[1]
+    wmaDirection := "bearish"
+else
+    wmaDirection := "neutral"
+
+//=====================================================================
+// DOM BUY/SELL VOLUME RATIO CALCULATION
+//=====================================================================
+
+// Extract buy/sell from wick structure (simplified DOM proxy)
+// High wick = buyer pressure, Low wick = seller pressure
+
+candeHigh = high
+candeLow = low
+candleOpen = open
+candleClose = close
+candleBody = candleClose - candleOpen
+
+upperWick = candleHigh - math.max(candleOpen, candleClose)
+lowerWick = math.min(candleOpen, candleClose) - candleLow
+
+// Buy/Sell ratio proxy from wick asymmetry
+// Bullish candle: close > open
+// Bearish candle: close < open
+
+buyVolume = upperWick + (candleBody > 0 ? volume * (candleBody / (upperWick + lowerWick + syminfo.mintick)) : 0)
+sellVolume = lowerWick + (candleBody < 0 ? volume * (math.abs(candleBody) / (upperWick + lowerWick + syminfo.mintick)) : 0)
+
+// Avoid division by zero
+buyVolume := math.max(buyVolume, syminfo.mintick)
+sellVolume := math.max(sellVolume, syminfo.mintick)
+
+buySellRatio = buyVolume / math.max(sellVolume, syminfo.mintick)
+
+//=====================================================================
+// BIAS CLASSIFICATION
+//=====================================================================
+
+string biasState = "unknown"
+color biasColor = color.gray
+
+if buySellRatio >= strongBullishRatio
+    biasState := "Strong Bullish"
+    biasColor := color.new(color.green, 0)
+else if buySellRatio >= neutralBullishRatioLow and buySellRatio < neutralBullishRatioHigh
+    biasState := "Neutral Bullish"
+    biasColor := color.new(color.orange, 0)
+else if buySellRatio >= neutralRatioLow and buySellRatio < neutralRatioHigh
+    biasState := "Neutral"
+    biasColor := color.new(color.gray, 50)
+else if buySellRatio >= neutralBearishRatioLow and buySellRatio < neutralBearishRatioHigh
+    biasState := "Neutral Bearish"
+    biasColor := color.new(color.fuchsia, 0)
+else if buySellRatio <= strongBearishRatio
+    biasState := "Strong Bearish"
+    biasColor := color.new(color.red, 0)
+
+//=====================================================================
+// LVN LEVEL LOCKING LOGIC
+//=====================================================================
+
+if showLVNLevels
+
+    // Get LVN levels from input source (FRVP indicator)
+    lvnVAH_current = lvnVAH_Input
+    lvnVAL_current = lvnVAL_Input
+
+    // Lock LVNVAH as Resistance
+    if not lvnVAH_isLocked and close >= lvnVAH_current and not na(lvnVAH_current)
+        lvnVAH_locked := lvnVAH_current
+        lvnVAH_isLocked := true
+        if showAlerts
+            alert("🔒 LVNVAH LOCKED @ " + str.tostring(lvnVAH_locked, "0.00") + " (RESISTANCE)", alert.freq_once_per_bar)
+
+    // Lock LVNVAL as Support
+    if not lvnVAL_isLocked and close <= lvnVAL_current and not na(lvnVAL_current)
+        lvnVAL_locked := lvnVAL_current
+        lvnVAL_isLocked := true
+        if showAlerts
+            alert("🔒 LVNVAL LOCKED @ " + str.tostring(lvnVAL_locked, "0.00") + " (SUPPORT)", alert.freq_once_per_bar)
+
+//=====================================================================
+// CONFLUENCE SCORING
+//=====================================================================
+
+// Score: 0-3 (3 = maximum confluence)
+confluenceScore = 0.0
+
+// Layer 1: WMA Alignment
+if wmaDirection == "bullish"
+    confluenceScore += (biasState == "Strong Bullish" ? 1.0 : (biasState == "Neutral Bullish" ? 0.5 : 0.0))
+else if wmaDirection == "bearish"
+    confluenceScore += (biasState == "Strong Bearish" ? 1.0 : (biasState == "Neutral Bearish" ? 0.5 : 0.0))
+
+// Layer 2: Price Proximity to Locked/Developing Levels
+if wmaDirection == "bullish"
+    if close >= lvnVAL_current
+        confluenceScore += 1.0
+else if wmaDirection == "bearish"
+    if close <= lvnVAH_current
+        confluenceScore += 1.0
+
+// Layer 3: Lock State (locked = higher confidence)
+if wmaDirection == "bullish"
+    confluenceScore += (lvnVAL_isLocked ? 1.0 : 0.5)
+else if wmaDirection == "bearish"
+    confluenceScore += (lvnVAH_isLocked ? 1.0 : 0.5)
+
+//=====================================================================
+// ENTRY SIGNAL GENERATION
+//=====================================================================
+
+string entrySignal = "NONE"
+bool shouldEnter = false
+color signalColor = color.gray
+
+// STRONG BULLISH ENTRY (Confluence 3/3)
+if wmaDirection == "bullish" and 
+   buySellRatio >= strongBullishRatio and 
+   close >= lvnVAL_current and 
+   confluenceScore >= 2.8
+
+    entrySignal := "🟢 STRONG BULLISH ENTRY (3/3)"
+    shouldEnter := true
+    signalColor := color.new(color.green, 0)
+
+    if alertOnStrongBullish and showAlerts
+        alert("🟢 STRONG BULLISH CONFLUENCE (3/3)\n" + 
+              "Ratio: " + str.tostring(buySellRatio, "0.00") + " (≥" + str.tostring(strongBullishRatio, "0.00") + ")\n" +
+              "WMA: BULLISH\n" +
+              "Price: " + str.tostring(close, "0.00") + " ≥ LVNVAL " + str.tostring(lvnVAL_current, "0.00") + "\n" +
+              "Lock State: " + (lvnVAL_isLocked ? "🔒 LOCKED" : "📈 DEVELOPING"),
+              alert.freq_once_per_bar)
+
+// WEAK BULLISH (Confluence 2/3) - Observation Mode
+else if wmaDirection == "bullish" and 
+        buySellRatio >= neutralBullishRatioLow and 
+        buySellRatio < strongBullishRatio and 
+        close >= lvnVAL_current and 
+        confluenceScore >= 1.5
+
+    entrySignal := "🟡 WEAK BULLISH (Observe - wait for ≥2.5)"
+    signalColor := color.new(color.orange, 50)
+
+// STRONG BEARISH ENTRY (Confluence 3/3)
+else if wmaDirection == "bearish" and 
+        buySellRatio <= strongBearishRatio and 
+        close <= lvnVAH_current and 
+        confluenceScore >= 2.8
+
+    entrySignal := "🔴 STRONG BEARISH ENTRY (3/3)"
+    shouldEnter := true
+    signalColor := color.new(color.red, 0)
+
+    if alertOnStrongBearish and showAlerts
+        alert("🔴 STRONG BEARISH CONFLUENCE (3/3)\n" + 
+              "Ratio: " + str.tostring(buySellRatio, "0.00") + " (≤" + str.tostring(strongBearishRatio, "0.00") + ")\n" +
+              "WMA: BEARISH\n" +
+              "Price: " + str.tostring(close, "0.00") + " ≤ LVNVAH " + str.tostring(lvnVAH_current, "0.00") + "\n" +
+              "Lock State: " + (lvnVAH_isLocked ? "🔒 LOCKED" : "📈 DEVELOPING"),
+              alert.freq_once_per_bar)
+
+// WEAK BEARISH (Confluence 2/3) - Observation Mode
+else if wmaDirection == "bearish" and 
+        buySellRatio <= neutralBearishRatioHigh and 
+        buySellRatio > strongBearishRatio and 
+        close <= lvnVAH_current and 
+        confluenceScore >= 1.5
+
+    entrySignal := "🔴 WEAK BEARISH (Observe - wait for ≤0.75)"
+    signalColor := color.new(color.fuchsia, 50)
+
+else
+    entrySignal := "⚪ NEUTRAL / NO SIGNAL"
+    signalColor := color.new(color.gray, 80)
+
+//=====================================================================
+// VISUAL: DOM BIAS BOX
+//=====================================================================
+
+if showBiasBox and bar_index > 0
+
+    // Box height as % of ATR
+    atr = ta.atr(14)
+    boxHeight_pips = atr * (boxHeight / 100)
+
+    // Position box based on bias
+    if biasState == "Strong Bullish"
+        box.new(
+             left = bar_index - boxWidth,
+             top = close + boxHeight_pips,
+             right = bar_index,
+             bottom = close,
+             border_color = color.new(color.green, 50),
+             border_width = 2,
+             bgcolor = color.new(color.green, 85),
+             xloc = xloc.bar_index
+        )
+
+    else if biasState == "Strong Bearish"
+        box.new(
+             left = bar_index - boxWidth,
+             top = close,
+             right = bar_index,
+             bottom = close - boxHeight_pips,
+             border_color = color.new(color.red, 50),
+             border_width = 2,
+             bgcolor = color.new(color.red, 85),
+             xloc = xloc.bar_index
+        )
+
+    else if biasState == "Neutral Bullish"
+        box.new(
+             left = bar_index - boxWidth,
+             top = close + (boxHeight_pips * 0.5),
+             right = bar_index,
+             bottom = close,
+             border_color = color.new(color.orange, 50),
+             border_width = 1,
+             bgcolor = color.new(color.orange, 90),
+             xloc = xloc.bar_index
+        )
+
+    else if biasState == "Neutral Bearish"
+        box.new(
+             left = bar_index - boxWidth,
+             top = close,
+             right = bar_index,
+             bottom = close - (boxHeight_pips * 0.5),
+             border_color = color.new(color.fuchsia, 50),
+             border_width = 1,
+             bgcolor = color.new(color.fuchsia, 90),
+             xloc = xloc.bar_index
+        )
+
+//=====================================================================
+// VISUAL: WMA(1440) OVERLAY
+//=====================================================================
+
+if showWMA
+    plot(
+         wma1440,
+         title = "WMA(1440) Trend Filter",
+         color = (wmaDirection == "bullish" ? wmaColor_Bullish : (wmaDirection == "bearish" ? wmaColor_Bearish : color.gray)),
+         linewidth = 2,
+         style = plot.style_stepline
+    )
+
+//=====================================================================
+// VISUAL: LVN LOCKED LEVELS
+//=====================================================================
+
+if showLVNLevels
+
+    // Plot locked LVNVAH (Resistance)
+    if lvnVAH_isLocked and not na(lvnVAH_locked)
+        line.new(
+             x1 = bar_index - 50,
+             y1 = lvnVAH_locked,
+             x2 = bar_index,
+             y2 = lvnVAH_locked,
+             xloc = xloc.bar_index,
+             color = lvnResistanceColor,
+             width = 3,
+             style = line.style_solid
+        )
+        
+        label.new(
+             x = bar_index,
+             y = lvnVAH_locked,
+             text = "🔒 R: " + str.tostring(lvnVAH_locked, "0.00"),
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = label.style_label_left,
+             color = lvnResistanceColor,
+             textcolor = color.white,
+             size = size.small
+        )
+
+    // Plot locked LVNVAL (Support)
+    if lvnVAL_isLocked and not na(lvnVAL_locked)
+        line.new(
+             x1 = bar_index - 50,
+             y1 = lvnVAL_locked,
+             x2 = bar_index,
+             y2 = lvnVAL_locked,
+             xloc = xloc.bar_index,
+             color = lvnSupportColor,
+             width = 3,
+             style = line.style_solid
+        )
+        
+        label.new(
+             x = bar_index,
+             y = lvnVAL_locked,
+             text = "🔒 S: " + str.tostring(lvnVAL_locked, "0.00"),
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = label.style_label_left,
+             color = lvnSupportColor,
+             textcolor = color.white,
+             size = size.small
+        )
+
+//=====================================================================
+// VISUAL: ENTRY SIGNAL LABEL
+//=====================================================================
+
+if showEntrySignals and shouldEnter
+
+    label.new(
+         x = bar_index,
+         y = high * 1.01,
+         text = entrySignal,
+         xloc = xloc.bar_index,
+         yloc = yloc.price,
+         style = label.style_label_down,
+         color = signalColor,
+         textcolor = color.white,
+         size = size.small
+    )
+
+//=====================================================================
+// CONFLUENCE TABLE
+//=====================================================================
+
+if showConfluenceTable and barstate.islast
+
+    var table confluenceTable = table.new(
+         position.top_right,
+         4,
+         9,
+         border_color = color.gray,
+         border_width = 1,
+         frame_color = color.gray,
+         frame_width = 1
+    )
+
+    table.clear(confluenceTable)
+
+    // Headers
+    table.cell(confluenceTable, 0, 0, "Parameter", text_halign = text.align_left, bgcolor = color.gray, text_color = color.white, text_size = size.small)
+    table.cell(confluenceTable, 1, 0, "Value", text_halign = text.align_center, bgcolor = color.gray, text_color = color.white, text_size = size.small)
+    table.cell(confluenceTable, 2, 0, "Status", text_halign = text.align_center, bgcolor = color.gray, text_color = color.white, text_size = size.small)
+    table.cell(confluenceTable, 3, 0, "Signal", text_halign = text.align_center, bgcolor = color.gray, text_color = color.white, text_size = size.small)
+
+    // Row 1: Buy/Sell Ratio
+    table.cell(confluenceTable, 0, 1, "Buy/Sell Ratio", text_halign = text.align_left, text_size = size.small)
+    table.cell(confluenceTable, 1, 1, str.tostring(buySellRatio, "0.00"), text_halign = text.align_center, text_size = size.small)
+    table.cell(confluenceTable, 2, 1, biasState, text_halign = text.align_center, bgcolor = biasColor, text_size = size.small)
+    
+    // Row 2: WMA(1440)
+    table.cell(confluenceTable, 0, 2, "WMA(1440)", text_halign = text.align_left, text_size = size.small)
+    table.cell(confluenceTable, 1, 2, str.tostring(wma1440, "0.00"), text_halign = text.align_center, text_size = size.small)
+    wmaColor = wmaDirection == "bullish" ? color.new(color.green, 50) : (wmaDirection == "bearish" ? color.new(color.red, 50) : color.gray)
+    table.cell(confluenceTable, 2, 2, str.upper(wmaDirection), text_halign = text.align_center, bgcolor = wmaColor, text_size = size.small)
+    
+    // Row 3: Price vs LVNVAL
+    priceVsVal = close - lvnVAL_current
+    priceVsValColor = close >= lvnVAL_current ? color.new(color.green, 50) : color.new(color.red, 50)
+    table.cell(confluenceTable, 0, 3, "Price vs LVNVAL", text_halign = text.align_left, text_size = size.small)
+    table.cell(confluenceTable, 1, 3, str.tostring(priceVsVal, "0.00"), text_halign = text.align_center, text_size = size.small)
+    table.cell(confluenceTable, 2, 3, (close >= lvnVAL_current ? "Above" : "Below"), text_halign = text.align_center, bgcolor = priceVsValColor, text_size = size.small)
+    
+    // Row 4: Price vs LVNVAH
+    priceVsVah = close - lvnVAH_current
+    priceVsVahColor = close <= lvnVAH_current ? color.new(color.green, 50) : color.new(color.red, 50)
+    table.cell(confluenceTable, 0, 4, "Price vs LVNVAH", text_halign = text.align_left, text_size = size.small)
+    table.cell(confluenceTable, 1, 4, str.tostring(priceVsVah, "0.00"), text_halign = text.align_center, text_size = size.small)
+    table.cell(confluenceTable, 2, 4, (close <= lvnVAH_current ? "Below" : "Above"), text_halign = text.align_center, bgcolor = priceVsVahColor, text_size = size.small)
+    
+    // Row 5: LVNVAL Lock State
+    lvnValState = lvnVAL_isLocked ? ("🔒 Locked @ " + str.tostring(lvnVAL_locked, "0.00")) : "📈 Developing"
+    table.cell(confluenceTable, 0, 5, "LVNVAL State", text_halign = text.align_left, text_size = size.small)
+    table.cell(confluenceTable, 1, 5, str.tostring(lvnVAL_current, "0.00"), text_halign = text.align_center, text_size = size.small)
+    table.cell(confluenceTable, 2, 5, lvnValState, text_halign = text.align_center, text_size = size.small)
+    
+    // Row 6: LVNVAH Lock State
+    lvnVahState = lvnVAH_isLocked ? ("🔒 Locked @ " + str.tostring(lvnVAH_locked, "0.00")) : "📈 Developing"
+    table.cell(confluenceTable, 0, 6, "LVNVAH State", text_halign = text.align_left, text_size = size.small)
+    table.cell(confluenceTable, 1, 6, str.tostring(lvnVAH_current, "0.00"), text_halign = text.align_center, text_size = size.small)
+    table.cell(confluenceTable, 2, 6, lvnVahState, text_halign = text.align_center, text_size = size.small)
+    
+    // Row 7: Value Zone Width
+    vzWidth = lvnVAH_current - lvnVAL_current
+    table.cell(confluenceTable, 0, 7, "Value Zone Width", text_halign = text.align_left, text_size = size.small)
+    table.cell(confluenceTable, 1, 7, str.tostring(vzWidth, "0.00"), text_halign = text.align_center, text_size = size.small)
+    table.cell(confluenceTable, 2, 7, "", text_halign = text.align_center, text_size = size.small)
+    
+    // Row 8: Confluence Score & Final Signal
+    table.cell(confluenceTable, 0, 8, "Confluence Score", text_halign = text.align_left, text_size = size.small)
+    table.cell(confluenceTable, 1, 8, str.tostring(confluenceScore, "0.0") + " / 3.0", text_halign = text.align_center, text_size = size.small)
+    signalBgColor = confluenceScore >= 2.8 ? color.new(color.green, 50) : (confluenceScore >= 1.5 ? color.new(color.orange, 50) : color.gray)
+    table.cell(confluenceTable, 2, 8, entrySignal, text_halign = text.align_center, bgcolor = signalBgColor, text_size = size.small)
+
+//=====================================================================
+// DEBUG PLOTS (Hidden, for troubleshooting)
+//=====================================================================
+
+plot(
+     buySellRatio,
+     title = "Buy/Sell Ratio (Hidden)",
+     display = display.none,
+     linewidth = 1
+)
+
+plot(
+     confluenceScore,
+     title = "Confluence Score (Hidden)",
+     display = display.none,
+     linewidth = 1
+)

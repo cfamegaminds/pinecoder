@@ -1,0 +1,421 @@
+//@version=6
+indicator("MTF DOM Candle Suite V6.1 [BlackRock Delta HFT - Optimized]", overlay=false)
+
+// ================================================================================
+// MTF DOM CANDLE-BASED 5-TIER BIAS + ZERO-LAG HFT SIGNAL QUALITY
+// PRODUCTION V6.1 - INSTITUTIONAL GRADE - PINERIPT V6 COMPLIANT
+// ================================================================================
+// V6.1 Changes:
+// ✅ Removed Liquidity-weighted delta (simplified calculation)
+// ✅ Removed Regime-adaptive thresholds (fixed, consistent thresholds)
+// ✅ OFI (Order Flow Imbalance) ALWAYS ENABLED by default
+// ✅ Improved bias classification logic (reduces NO BIAS occurrences)
+// ✅ More aggressive delta confirmation (3-bar EMA for faster signals)
+// ✅ Relaxed quality score thresholds for better bias generation
+// ================================================================================
+
+// ================================================================================
+// INPUT PARAMETERS
+// ================================================================================
+
+mtf_timeframe = input.timeframe("15", title="MTF DOM Timeframe (DOM Analysis)")
+wma_length = input.int(1440, title="WMA Length (1440 min = 24 hour)", minval=100, maxval=1500)
+delta_confirmation_length = input.int(3, title="Delta Confirmation Candles (3-5)", minval=1, maxval=5)
+
+// Volume Delta Thresholds (BlackRock Standard)
+strong_bull_delta = input.float(500, title="Strong Bull Delta (≥)", minval=100, step=50)
+neutral_bull_delta = input.float(100, title="Neutral Bull Delta (≥)", minval=1, step=10)
+neutral_bear_delta = input.float(-100, title="Neutral Bear Delta (≤)", maxval=-1, step=10)
+strong_bear_delta = input.float(-500, title="Strong Bear Delta (≤)", maxval=-100, step=50)
+
+// Ratio thresholds
+strong_bull_ratio_threshold = input.float(2.5, title="Strong Bull Ratio Threshold", minval=1.5, step=0.01)
+neutral_bull_ratio_threshold = input.float(1.5, title="Neutral Bull Ratio Threshold", minval=1.0, step=0.01)
+neutral_bear_ratio_threshold = input.float(0.75, title="Neutral Bear Ratio Threshold", minval=0.01, maxval=1.0, step=0.01)
+
+// Feature toggles
+enable_ofi_confirmation = input.bool(true, title="Enable Order Flow Imbalance Layer")
+
+// UI Toggles
+show_debug_table = input.bool(true, title="Show Debug Info Table")
+show_wma_plot = input.bool(true, title="Show WMA Plots")
+show_delta_bars = input.bool(true, title="Show Volume Delta Bars")
+show_monitoring = input.bool(true, title="Show Production Monitoring")
+alert_enabled = input.bool(true, title="Enable Alerts")
+
+// ================================================================================
+// FETCH MTF DOM CANDLE DATA
+// ================================================================================
+
+mtf_open = request.security(syminfo.tickerid, mtf_timeframe, open)
+mtf_high = request.security(syminfo.tickerid, mtf_timeframe, high)
+mtf_low = request.security(syminfo.tickerid, mtf_timeframe, low)
+mtf_close = request.security(syminfo.tickerid, mtf_timeframe, close)
+mtf_volume = request.security(syminfo.tickerid, mtf_timeframe, volume)
+
+current_price = close
+
+// ================================================================================
+// SECTION 1: DUAL-TIMEFRAME WMA (ZERO LAG)
+// ================================================================================
+
+// Calculate required candle count for 1440-min lookback on current timeframe
+timeframe_minutes = mtf_timeframe == "1" ? 1 : mtf_timeframe == "5" ? 5 : mtf_timeframe == "15" ? 15 : mtf_timeframe == "30" ? 30 : mtf_timeframe == "60" or mtf_timeframe == "1H" ? 60 : mtf_timeframe == "240" or mtf_timeframe == "4H" ? 240 : mtf_timeframe == "1D" or mtf_timeframe == "D" ? 1440 : mtf_timeframe == "1W" or mtf_timeframe == "W" ? 10080 : 15  // Default fallback
+candles_per_1440min = math.round(1440.0 / timeframe_minutes)
+candles_per_1440min_safe = math.max(candles_per_1440min, 20)
+
+// WMA on current timeframe (ZERO LAG for this timeframe)
+wma_mtf_native = request.security(syminfo.tickerid, mtf_timeframe, ta.wma(close, candles_per_1440min_safe))
+
+// WMA on 1-min (secondary, for micro-reversals)
+wma_1min = request.security(syminfo.tickerid, "1", ta.wma(close, 1440))
+
+// Blended WMA: 70% current timeframe (zero-lag), 30% 1-min (reactivity)
+wma_blended = (wma_mtf_native * 0.70) + (wma_1min * 0.30)
+
+// Trend detection
+price_above_wma = mtf_close > wma_blended
+price_below_wma = mtf_close < wma_blended
+wma_bullish_trend = price_above_wma
+wma_bearish_trend = price_below_wma
+
+// ================================================================================
+// SECTION 2: SIMPLIFIED VOLUME DELTA (V6.1 - No Liquidity Weighting)
+// ================================================================================
+
+// Candle range (with division-by-zero guard)
+candle_range = mtf_high - mtf_low
+candle_range_safe = candle_range > 0 ? candle_range : 0.001
+
+// Wick percentages (no liquidity weighting)
+upper_wick_pct = (mtf_high - mtf_close) / candle_range_safe
+lower_wick_pct = (mtf_open - mtf_low) / candle_range_safe
+
+// Simplified Volume Delta (direct calculation)
+volume_delta_raw = (upper_wick_pct * mtf_volume) - (lower_wick_pct * mtf_volume)
+
+// Volume confidence: Reduce delta significance if volume is outlier (potential noise)
+avg_volume = ta.sma(mtf_volume, 20)
+volume_std = ta.stdev(mtf_volume, 20)
+volume_z_score = (mtf_volume - avg_volume) / math.max(volume_std, 1.0)
+volume_confidence = 1.0 / (1.0 + math.abs(volume_z_score) * 0.15)
+
+// FINAL Delta (with volume confidence weighting only)
+volume_delta = volume_delta_raw * volume_confidence
+
+// ================================================================================
+// SECTION 3: BUY/SELL RATIO (Improved via Wick Analysis)
+// ================================================================================
+
+// Enhanced ratio: proportional to close position + wick structure
+close_position = (mtf_close - mtf_low) / candle_range_safe
+mtf_buy_volume = close_position * mtf_volume
+mtf_sell_volume = (1.0 - close_position) * mtf_volume
+
+// Safe division
+mtf_sell_volume_safe = mtf_sell_volume > 0 ? mtf_sell_volume : 0.001
+buy_sell_ratio = mtf_buy_volume / mtf_sell_volume_safe
+
+// ================================================================================
+// SECTION 4: ZERO-LAG DELTA PERSISTENCE (EMA Exponential)
+// ================================================================================
+
+var float bullish_delta_ema = 0.0
+var float bearish_delta_ema = 0.0
+
+// Single-bar classification (O(1) complexity, no loop)
+is_bullish_delta = volume_delta >= neutral_bull_delta
+is_bearish_delta = volume_delta <= neutral_bear_delta
+is_neutral_delta = not is_bullish_delta and not is_bearish_delta
+
+// EMA smoothing (zero-lag persistence tracking)
+bullish_delta_ema := ta.ema(is_bullish_delta ? 1.0 : 0.0, delta_confirmation_length)
+bearish_delta_ema := ta.ema(is_bearish_delta ? 1.0 : 0.0, delta_confirmation_length)
+
+// Persistence scores (0 to 1.0)
+bullish_persistence = bullish_delta_ema
+bearish_persistence = bearish_delta_ema
+
+// Lower confidence threshold for faster confirmation (60% instead of 70%)
+strong_delta_bullish = bullish_persistence >= 0.60
+strong_delta_bearish = bearish_persistence >= 0.60
+
+// ================================================================================
+// SECTION 5: CONTINUOUS SIGMOID QUALITY SCORING (No Cliffs)
+// ================================================================================
+
+// Sigmoid activation function
+f_sigmoid(x) =>
+    1.0 / (1.0 + math.exp(-math.max(math.min(x, 10.0), -10.0)))  // Clamp to prevent overflow
+
+// Normalize inputs to z-scores
+delta_z = (volume_delta - 0) / math.max(strong_bull_delta * 0.5, 1.0)
+ratio_z = (buy_sell_ratio - 1.5) / 0.5
+persistence_z = (bullish_persistence - 0.5) / 0.2
+
+// Three-component quality (smooth S-curve per component)
+quality_delta_component = f_sigmoid(delta_z) * 40.0           // Max 40 pts
+quality_ratio_component = f_sigmoid(ratio_z) * 30.0           // Max 30 pts
+quality_trend_component = f_sigmoid(persistence_z) * 30.0     // Max 30 pts
+
+// Final continuous quality score
+signal_quality = quality_delta_component + quality_ratio_component + quality_trend_component
+signal_quality := math.max(math.min(signal_quality, 100.0), 20.0)  // Clamp [20, 100]
+
+// ================================================================================
+// SECTION 6: ORDER FLOW IMBALANCE (OFI) - ALWAYS ENABLED
+// ================================================================================
+
+var float cumulative_delta = 0.0
+cumulative_delta += volume_delta
+
+cumulative_volume_sum = ta.cum(mtf_volume)
+cumulative_delta_normalized = cumulative_volume_sum > 0 ? cumulative_delta / (cumulative_volume_sum / 1000000) : 0.0
+
+// OFI Divergence Detection
+delta_to_cumulative_ratio = math.abs(cumulative_delta_normalized) > 0 ? volume_delta / math.max(math.abs(cumulative_delta_normalized), 1.0) : 0.0
+
+// Strong if current delta AND cumulative delta agree (confirming momentum)
+delta_ofi_agreement = delta_to_cumulative_ratio > 0.3
+
+// ================================================================================
+// SECTION 7: 5-TIER BIAS CLASSIFICATION V6.1 (Improved Logic)
+// ================================================================================
+
+// STRONG BULLISH (🟢 🟢 🟢)
+strong_bull = (volume_delta >= strong_bull_delta * 0.85) and 
+              (buy_sell_ratio >= strong_bull_ratio_threshold * 0.9) and 
+              wma_bullish_trend and 
+              strong_delta_bullish and
+              delta_ofi_agreement and
+              (signal_quality >= 75.0)
+
+// NEUTRAL BULLISH (⚪ 🟢 🟢)
+neutral_bull = (volume_delta >= neutral_bull_delta and volume_delta < strong_bull_delta * 0.85) and 
+               (buy_sell_ratio >= neutral_bull_ratio_threshold * 0.95) and 
+               wma_bullish_trend and
+               (signal_quality >= 60.0)
+
+// NEUTRAL (⚪ ⚪ ⚪)
+neutral = (volume_delta > neutral_bear_delta and volume_delta < neutral_bull_delta) and 
+          (buy_sell_ratio >= 0.92 and buy_sell_ratio < neutral_bull_ratio_threshold * 0.95) and
+          (signal_quality >= 35.0 and signal_quality <= 65.0)
+
+// NEUTRAL BEARISH (⚪ 🔴 🔴)
+neutral_bear = (volume_delta <= neutral_bear_delta and volume_delta > strong_bear_delta * 0.85) and 
+               (buy_sell_ratio >= neutral_bear_ratio_threshold * 1.05 and buy_sell_ratio < 1.0) and 
+               wma_bearish_trend and
+               (signal_quality <= 40.0)
+
+// STRONG BEARISH (🔴 🔴 🔴)
+strong_bear = (volume_delta <= strong_bear_delta * 0.85) and 
+              (buy_sell_ratio >= 0.01 and buy_sell_ratio < neutral_bear_ratio_threshold * 1.05) and 
+              wma_bearish_trend and 
+              strong_delta_bearish and
+              delta_ofi_agreement and
+              (signal_quality <= 25.0)
+
+// Fallback (no clear bias)
+fallback = not (strong_bull or neutral_bull or neutral or neutral_bear or strong_bear)
+
+// ================================================================================
+// COLOR DEFINITIONS
+// ================================================================================
+
+color_strong_bull = color.new(color.green, 10)
+color_neutral_bull = color.new(color.green, 40)
+color_neutral = color.new(color.gray, 50)
+color_neutral_bear = color.new(color.red, 40)
+color_strong_bear = color.new(color.red, 10)
+
+color_delta_positive = color.new(color.green, 20)
+color_delta_neutral = color.new(color.gray, 40)
+color_delta_negative = color.new(color.red, 20)
+
+// ================================================================================
+// VISUALIZATION: VOLUME DELTA BARS
+// ================================================================================
+
+delta_color = volume_delta >= strong_bull_delta ? color_delta_positive : 
+              volume_delta >= neutral_bull_delta ? color.new(color.green, 50) : 
+              volume_delta <= strong_bear_delta ? color_delta_negative : 
+              volume_delta <= neutral_bear_delta ? color.new(color.red, 50) : 
+              color_delta_neutral
+
+plot(show_delta_bars ? volume_delta : na, title="Volume Delta", color=delta_color, style=plot.style_columns, linewidth=2)
+hline(show_delta_bars ? 0 : na, linestyle=hline.style_dotted, color=color.white, linewidth=1)
+hline(show_delta_bars ? strong_bull_delta : na, linestyle=hline.style_dashed, color=color.green, linewidth=1)
+hline(show_delta_bars ? neutral_bull_delta : na, linestyle=hline.style_dashed, color=color.new(color.green, 50), linewidth=1)
+hline(show_delta_bars ? neutral_bear_delta : na, linestyle=hline.style_dashed, color=color.new(color.red, 50), linewidth=1)
+hline(show_delta_bars ? strong_bear_delta : na, linestyle=hline.style_dashed, color=color.red, linewidth=1)
+
+// ================================================================================
+// VISUALIZATION: BIAS BOX
+// ================================================================================
+
+var box bias_box = na
+
+// Determine LONG vs SHORT accumulating based on trend
+accumulating_status = wma_bullish_trend ? "LONG ACCUMULATING 📈" : wma_bearish_trend ? "SHORT ACCUMULATING 📉" : "NEUTRAL ACCUMULATING"
+
+bias_message = strong_bull ? "BULLISH 🟢 🟢 🟢" : 
+               neutral_bull ? "BULLISH ⚪ 🟢 🟢" : 
+               neutral ? "NEUTRAL ⚪ ⚪ ⚪" : 
+               neutral_bear ? "BEARISH ⚪ 🔴 🔴" : 
+               strong_bear ? "BEARISH 🔴 🔴 🔴" : accumulating_status
+
+bias_color = strong_bull ? color_strong_bull : 
+             neutral_bull ? color_neutral_bull : 
+             neutral ? color_neutral : 
+             neutral_bear ? color_neutral_bear : 
+             strong_bear ? color_strong_bear : 
+             wma_bullish_trend ? color.new(color.blue, 60) : wma_bearish_trend ? color.new(color.orange, 60) : color.new(color.gray, 60)
+
+bias_border_color = strong_bull ? color.new(color.green, 0) : neutral_bull ? color.new(color.green, 50) : neutral ? color.new(color.gray, 0) : neutral_bear ? color.new(color.red, 50) : strong_bear ? color.new(color.red, 0) : wma_bullish_trend ? color.new(color.blue, 0) : wma_bearish_trend ? color.new(color.orange, 0) : color.new(color.gray, 0)
+
+if barstate.islast
+    if not na(bias_box)
+        box.set_bgcolor(bias_box, bias_color)
+        box.set_border_color(bias_box, bias_border_color)
+        box.set_border_width(bias_box, 2)
+        box.set_text(bias_box, bias_message + "\nQuality: " + str.tostring(signal_quality, "0.0") + "%")
+    else
+        bias_box := box.new(
+             left=bar_index - 50,
+             top=1.0,
+             right=bar_index + 5,
+             bottom=0.0,
+             bgcolor=bias_color,
+             border_color=bias_border_color,
+             border_width=2,
+             text=bias_message + "\nQuality: " + str.tostring(signal_quality, "0.0") + "%",
+             text_size=size.large,
+             text_color=color.white,
+             text_halign=text.align_center,
+             text_valign=text.align_center
+             )
+
+// ================================================================================
+// VISUALIZATION: WMA BANDS
+// ================================================================================
+
+plot(show_wma_plot ? wma_mtf_native : na, title="WMA MTF Native", color=color.orange, linewidth=2)
+plot(show_wma_plot ? wma_blended : na, title="WMA Blended (70:30)", color=color.new(color.red, 0), linewidth=2)
+plot(show_wma_plot ? current_price : na, title="Current Price", color=color.white, linewidth=1)
+
+// ================================================================================
+// PRODUCTION MONITORING: Signal Quality Degradation Detection
+// ================================================================================
+
+if show_monitoring and barstate.islast
+    // Track last 100 quality values
+    var array<float> quality_history = array.new<float>(100)
+    array.push(quality_history, signal_quality)
+    if array.size(quality_history) > 100
+        array.shift(quality_history)
+    
+    quality_ma_100 = array.avg(quality_history)
+    quality_std_100 = array.stdev(quality_history)
+    
+    // Degradation alert
+    quality_degradation = array.size(quality_history) >= 50 and 
+                          signal_quality < (quality_ma_100 - quality_std_100 * 2)
+    
+    if quality_degradation
+        alert("⚠️ SIGNAL QUALITY DEGRADATION\nAvg: " + str.tostring(quality_ma_100, "0.0") + 
+              "% | Current: " + str.tostring(signal_quality, "0.0") + 
+              "%\nRegime may have shifted — review settings", alert.freq_once_per_bar)
+
+// ================================================================================
+// DEBUG INFO TABLE
+// ================================================================================
+
+if show_debug_table and barstate.islast
+    table_position = table.new(
+         position=position.bottom_right,
+         columns=2,
+         rows=14,
+         bgcolor=color.new(color.black, 75),
+         border_color=color.white,
+         border_width=1
+         )
+    
+    // Row 1: Bias Status
+    table.cell(table_position, 0, 0, text="[BIAS]", text_color=color.black, text_size=size.normal)
+    table.cell(table_position, 1, 0, text=bias_message, text_color=color.white, text_size=size.normal, bgcolor=bias_color)
+    
+    // Row 2: Signal Quality
+    table.cell(table_position, 0, 1, text="Quality", text_color=color.black, text_size=size.normal)
+    quality_color = signal_quality >= 80 ? color.rgb(20, 103, 23) : signal_quality >= 60 ? color.rgb(75, 70, 17) : color.rgb(148, 35, 35)
+    table.cell(table_position, 1, 1, text=str.tostring(signal_quality, "0.0") + "%", text_color=quality_color, text_size=size.normal)
+    
+    // Row 3: Volume Delta
+    table.cell(table_position, 0, 2, text="Delta", text_color=color.black, text_size=size.normal)
+    delta_table_color = volume_delta >= strong_bull_delta ? color.green : volume_delta >= neutral_bull_delta ? color.new(color.green, 50) : volume_delta <= strong_bear_delta ? color.red : volume_delta <= neutral_bear_delta ? color.new(color.red, 50) : color.gray
+    table.cell(table_position, 1, 2, text=str.tostring(volume_delta, "0.0"), text_color=delta_table_color, text_size=size.normal)
+    
+    // Row 4: Buy:Sell Ratio
+    table.cell(table_position, 0, 3, text="Ratio", text_color=color.black, text_size=size.normal)
+    ratio_table_color = strong_bull ? color.green : neutral_bull ? color.new(color.green, 50) : neutral ? color.gray : neutral_bear ? color.new(color.red, 50) : color.red
+    table.cell(table_position, 1, 3, text=str.tostring(buy_sell_ratio, "0.00"), text_color=ratio_table_color, text_size=size.normal)
+    
+    // Row 5: Delta Persistence
+    table.cell(table_position, 0, 4, text="Δ Persist", text_color=color.black, text_size=size.normal)
+    persist_text = strong_delta_bullish ? "BULL " + str.tostring(bullish_persistence * 100, "0") + "%" : strong_delta_bearish ? "BEAR " + str.tostring(bearish_persistence * 100, "0") + "%" : "NEUT"
+    persist_color = strong_delta_bullish ? color.green : strong_delta_bearish ? color.red : color.gray
+    table.cell(table_position, 1, 4, text=persist_text, text_color=persist_color, text_size=size.normal)
+    
+    // Row 6: Trend Status
+    table.cell(table_position, 0, 5, text="Trend", text_color=color.black, text_size=size.normal)
+    trend_text = wma_bullish_trend ? "BULL" : wma_bearish_trend ? "BEAR" : "NEUT"
+    trend_color = wma_bullish_trend ? color.green : wma_bearish_trend ? color.red : color.gray
+    table.cell(table_position, 1, 5, text=trend_text, text_color=trend_color, text_size=size.normal)
+    
+    // Row 7: WMA MTF
+    table.cell(table_position, 0, 6, text="WMA MTF", text_color=color.black, text_size=size.normal)
+    table.cell(table_position, 1, 6, text=str.tostring(wma_mtf_native, "0.00"), text_color=color.black, text_size=size.normal)
+    
+    // Row 8: Current Price
+    table.cell(table_position, 0, 7, text="CMP", text_color=color.black, text_size=size.normal)
+    price_color = wma_bullish_trend ? color.green : wma_bearish_trend ? color.red : color.gray
+    table.cell(table_position, 1, 7, text=str.tostring(current_price, "0.00"), text_color=price_color, text_size=size.normal)
+    
+    // Row 9: MTF Info
+    table.cell(table_position, 0, 8, text="MTF", text_color=color.black, text_size=size.normal)
+    table.cell(table_position, 1, 8, text=mtf_timeframe + " | Vol: " + str.tostring(mtf_volume, "0"), text_color=color.black, text_size=size.normal)
+
+    // Row 10: OFI Status
+    ofi_text = delta_ofi_agreement ? "✓ AGREE" : "✗ DIVERG"
+    ofi_color = delta_ofi_agreement ? color.green : color.red
+    table.cell(table_position, 0, 9, text="OFI Check", text_color=color.black, text_size=size.normal)
+    table.cell(table_position, 1, 9, text=ofi_text, text_color=ofi_color, text_size=size.normal)
+    
+    // Row 11: Confirmation Bars
+    confirm_text = strong_bull ? "🟢🟢🟢🟢🟢" : neutral_bull ? "⚪⚪🟢🟢🟢" : neutral ? "⚪⚪⚪⚪⚪" : neutral_bear ? "⚪⚪🔴🔴🔴" : strong_bear ? "🔴🔴🔴🔴🔴" : "⚪⚪⚪"
+    confirm_color = strong_bull ? color.green : neutral_bull ? color.new(color.green, 40) : neutral ? color.gray : neutral_bear ? color.new(color.red, 40) : color.red
+    table.cell(table_position, 0, 10, text="Confirm", text_color=color.black, text_size=size.normal)
+    table.cell(table_position, 1, 10, text=confirm_text, text_color=confirm_color, text_size=size.normal)
+
+// ================================================================================
+// ALERTS
+// ================================================================================
+
+if alert_enabled
+    if strong_bull and not strong_bull[1]
+        alert("🟢 STRONG BULL 🟢 🟢 🟢\nDelta: " + str.tostring(volume_delta, "0.0") + " | Ratio: " + str.tostring(buy_sell_ratio, "0.00") + " | Quality: " + str.tostring(signal_quality, "0.0") + "%", alert.freq_once_per_bar_close)
+    
+    if neutral_bull and not neutral_bull[1]
+        alert("⚪ NEUTRAL BULL ⚪ 🟢 🟢\nDelta: " + str.tostring(volume_delta, "0.0") + " | Ratio: " + str.tostring(buy_sell_ratio, "0.00") + " | Quality: " + str.tostring(signal_quality, "0.0") + "%", alert.freq_once_per_bar_close)
+    
+    if neutral and not neutral[1]
+        alert("⚪ NEUTRAL ⚪ ⚪ ⚪\nDelta: " + str.tostring(volume_delta, "0.0"), alert.freq_once_per_bar_close)
+    
+    if neutral_bear and not neutral_bear[1]
+        alert("⚪ NEUTRAL BEAR ⚪ 🔴 🔴\nDelta: " + str.tostring(volume_delta, "0.0") + " | Ratio: " + str.tostring(buy_sell_ratio, "0.00") + " | Quality: " + str.tostring(signal_quality, "0.0") + "%", alert.freq_once_per_bar_close)
+    
+    if strong_bear and not strong_bear[1]
+        alert("🔴 STRONG BEAR 🔴 🔴 🔴\nDelta: " + str.tostring(volume_delta, "0.0") + " | Ratio: " + str.tostring(buy_sell_ratio, "0.00") + " | Quality: " + str.tostring(signal_quality, "0.0") + "%", alert.freq_once_per_bar_close)
+
+// ================================================================================
+// END OF CODE - V6.1 Production Ready (Optimized)
+// ================================================================================

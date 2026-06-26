@@ -1,0 +1,625 @@
+//@version=6
+indicator(
+     "Volume Delta + LVN [3:30] BlackRock PRO V1.0",
+     overlay = true,
+     max_lines_count = 500,
+     max_boxes_count = 500,
+     max_labels_count = 500,
+     max_bars_back = 5000
+)
+
+//=====================================================================
+// PRODUCTION SETTINGS
+//=====================================================================
+
+// Volume Delta
+useDeltaWeighting = input.bool(
+     true,
+     "Enable Volume Delta Weighting"
+)
+
+deltaSmoothing = input.int(
+     14,
+     "Delta EMA Period",
+     minval = 5,
+     maxval = 50
+)
+
+// LVN
+showLVN = input.bool(
+     true,
+     "Show LVN (Last Value Normal)"
+)
+
+lvnVAHColor = input.color(
+     color.new(color.lime, 25),
+     "LVN VAH Color"
+)
+
+lvnVALColor = input.color(
+     color.new(color.red, 25),
+     "LVN VAL Color"
+)
+
+lvnWidth = input.int(
+     3,
+     "LVN Line Width",
+     minval = 1,
+     maxval = 5
+)
+
+showLVNLabels = input.bool(
+     true,
+     "Show LVN Labels"
+)
+
+pocWidth = input.int(
+     4,
+     "POC Width",
+     minval = 1,
+     maxval = 10
+)
+
+pocColor = input.color(
+     color.blue,
+     "POC Color"
+)
+
+extendIntoNext = input.bool(
+     true,
+     "Extend POC Across Next Session"
+)
+
+// Profile
+rows = input.int(
+     80,
+     "Profile Rows",
+     minval = 10,
+     maxval = 180
+)
+
+profilesToShow = input.int(
+     15,
+     "Profiles To Plot",
+     minval = 1,
+     maxval = 50
+)
+
+//=====================================================================
+// SESSION SETTINGS
+//=====================================================================
+
+string tz = "Asia/Kolkata"
+sessHour   = 3
+sessMinute = 30
+
+curHour = hour(time, tz)
+curMin  = minute(time, tz)
+
+newSession = (curHour == sessHour and curMin == sessMinute)
+
+//=====================================================================
+// VOLUME DELTA CALCULATION (Production Grade)
+//=====================================================================
+
+// High-precision buy/sell volume distribution
+calcVolumeDelta(_startBar, _endBar) =>
+    
+    float bidVol = 0.0
+    float askVol = 0.0
+    float totalDelta = 0.0
+    var float[] deltaBuffer = array.new_float(0)
+    
+    safeStart = math.max(_startBar, bar_index - 4999)
+    
+    for i = safeStart to _endBar
+        
+        barsBack = bar_index - i
+        
+        if barsBack >= 0 and barsBack < 5000
+            
+            barClose = close[barsBack]
+            barOpen = open[barsBack]
+            barVol = volume[barsBack]
+            
+            // Bid/Ask inference: close above open = buying pressure
+            if barClose > barOpen
+                bidVol += barVol * 0.7
+                askVol += barVol * 0.3
+            else if barClose < barOpen
+                bidVol += barVol * 0.3
+                askVol += barVol * 0.7
+            else
+                bidVol += barVol * 0.5
+                askVol += barVol * 0.5
+    
+    totalDelta = bidVol - askVol
+    
+    [totalDelta, bidVol, askVol]
+
+//=====================================================================
+// ARRAYS
+//=====================================================================
+
+var int[]  sessionStarts = array.new_int()
+var int[]  sessionEnds   = array.new_int()
+var line[] pocLines      = array.new_line()
+var line[] lvnLines      = array.new_line()
+var label[] allLabels    = array.new_label()
+
+var float developingVAH = na
+var float developingVAL = na
+var float lvnVAH = na
+var float lvnVAL = na
+var float sessionDelta = 0.0
+var int lvnSessionStart = na
+var int lvnSessionEnd = na
+
+//=====================================================================
+// SESSION DETECTION
+//=====================================================================
+
+if newSession
+    
+    if array.size(sessionStarts) > array.size(sessionEnds)
+        previousEnd = bar_index - 1
+        array.push(sessionEnds, previousEnd)
+    
+    array.push(sessionStarts, bar_index)
+    
+    while array.size(sessionStarts) > profilesToShow + 1
+        array.shift(sessionStarts)
+    
+    while array.size(sessionEnds) > profilesToShow
+        array.shift(sessionEnds)
+    
+    sessionDelta := 0.0
+
+//=====================================================================
+// PROFILE CALCULATION FUNCTION
+//=====================================================================
+
+calcProfileLevels(_startBar, _endBar, _rows, _useDelta) =>
+    
+    float hi = na
+    float lo = na
+    
+    safeStart = math.max(_startBar, bar_index - 4999)
+    
+    for i = safeStart to _endBar
+        
+        barsBack = bar_index - i
+        
+        if barsBack >= 0 and barsBack < 5000
+            
+            hi := na(hi) ? high[barsBack] : math.max(hi, high[barsBack])
+            lo := na(lo) ? low[barsBack] : math.min(lo, low[barsBack])
+    
+    if na(hi) or na(lo)
+        
+        [na, na, na]
+    
+    else
+        
+        float myRange = math.max(hi - lo, syminfo.mintick)
+        step = myRange / _rows
+        
+        float[] volumeRows = array.new_float(_rows, 0.0)
+        totalVol = 0.0
+        
+        // VOLUME DISTRIBUTION WITH DELTA WEIGHTING
+        for i = safeStart to _endBar
+            
+            barsBack = bar_index - i
+            
+            if barsBack >= 0 and barsBack < 5000
+                
+                barHigh = high[barsBack]
+                barLow = low[barsBack]
+                barVol = volume[barsBack]
+                
+                // Apply Volume Delta weighting if enabled
+                if _useDelta
+                    
+                    [delta, bid, ask] = calcVolumeDelta(i, i)
+                    
+                    // Weight volume by delta direction
+                    if delta > 0
+                        barVol := barVol * (1.0 + math.min(delta / 1000000, 0.5))
+                    else if delta < 0
+                        barVol := barVol * (1.0 - math.min(math.abs(delta) / 1000000, 0.5))
+                
+                totalVol += barVol
+                
+                barRange = math.max(barHigh - barLow, syminfo.mintick)
+                
+                for r = 0 to _rows - 1
+                    
+                    rowLow = lo + step * r
+                    rowHigh = rowLow + step
+                    
+                    overlap = math.max(
+                        math.min(barHigh, rowHigh) - math.max(barLow, rowLow),
+                        0
+                    )
+                    
+                    if overlap > 0
+                        
+                        volToAdd = barVol * (overlap / barRange)
+                        currentVol = array.get(volumeRows, r)
+                        
+                        array.set(volumeRows, r, currentVol + volToAdd)
+        
+        // FIND POC (Point of Control)
+        maxVol = 0.0
+        pocRow = 0
+        
+        for r = 0 to _rows - 1
+            
+            rowVol = array.get(volumeRows, r)
+            
+            if rowVol > maxVol
+                maxVol := rowVol
+                pocRow := r
+        
+        poc = lo + step * pocRow + step * 0.5
+        
+        // VALUE AREA (79% of volume)
+        targetVol = totalVol * 0.79
+        currentVA = maxVol
+        vahRow = pocRow
+        valRow = pocRow
+        
+        while currentVA < targetVol
+            
+            upVol = vahRow < _rows - 1 ? array.get(volumeRows, vahRow + 1) : 0
+            downVol = valRow > 0 ? array.get(volumeRows, valRow - 1) : 0
+            
+            if upVol >= downVol
+                vahRow += 1
+                currentVA += upVol
+            else
+                valRow -= 1
+                currentVA += downVol
+        
+        vah = lo + step * vahRow + step
+        val = lo + step * valRow
+        
+        [poc, vah, val]
+
+//=====================================================================
+// TRACK LVN (Last Value Normal)
+//=====================================================================
+
+devSessionStart = array.size(sessionStarts) > 0 
+    ? array.get(sessionStarts, array.size(sessionStarts) - 1) 
+    : na
+
+// Initialize LVN for new session
+if not na(devSessionStart) and (na(lvnSessionStart) or devSessionStart > lvnSessionStart)
+    
+    lvnSessionStart := devSessionStart
+    lvnSessionEnd := na
+    lvnVAH := na
+    lvnVAL := na
+
+// Check if current session has ended
+if array.size(sessionEnds) > 0
+    
+    latestSessionEnd = array.get(sessionEnds, array.size(sessionEnds) - 1)
+    
+    if not na(latestSessionEnd) and latestSessionEnd == bar_index - 1
+        lvnSessionEnd := latestSessionEnd
+
+// Update LVN with max VAH and min VAL from developing session
+if not na(devSessionStart) and bar_index % 5 == 0
+    
+    [tmpPOC, tmpVAH, tmpVAL] = calcProfileLevels(
+        devSessionStart,
+        bar_index,
+        rows,
+        useDeltaWeighting
+    )
+    
+    developingVAH := tmpVAH
+    developingVAL := tmpVAL
+    
+    if na(lvnVAH)
+        lvnVAH := tmpVAH
+    else
+        lvnVAH := math.max(lvnVAH, tmpVAH)
+    
+    if na(lvnVAL)
+        lvnVAL := tmpVAL
+    else
+        lvnVAL := math.min(lvnVAL, tmpVAL)
+
+//=====================================================================
+// SESSION DELTA TRACKING
+//=====================================================================
+
+if not na(devSessionStart) and bar_index % 10 == 0
+    
+    [sessionDelta, _, _] = calcVolumeDelta(devSessionStart, bar_index)
+
+//=====================================================================
+// DRAWING LOGIC
+//=====================================================================
+
+if barstate.islast
+    
+    // Clear old drawings
+    if array.size(pocLines) > 0
+        for i = 0 to array.size(pocLines) - 1
+            line.delete(array.get(pocLines, i))
+    array.clear(pocLines)
+    
+    if array.size(lvnLines) > 0
+        for i = 0 to array.size(lvnLines) - 1
+            line.delete(array.get(lvnLines, i))
+    array.clear(lvnLines)
+    
+    if array.size(allLabels) > 0
+        for i = 0 to array.size(allLabels) - 1
+            label.delete(array.get(allLabels, i))
+    array.clear(allLabels)
+    
+    sessionCount = math.min(
+        array.size(sessionEnds),
+        profilesToShow
+    )
+    
+    // DRAW POC FOR EACH SESSION
+    if sessionCount > 0
+        
+        for s = 0 to sessionCount - 1
+            
+            startBar = array.get(sessionStarts, s)
+            endBar = array.get(sessionEnds, s)
+            
+            if endBar > startBar
+                
+                [poc, vah, val] = calcProfileLevels(
+                    startBar,
+                    endBar,
+                    rows,
+                    useDeltaWeighting
+                )
+                
+                if not na(poc)
+                    
+                    startBack = bar_index - startBar
+                    endBack = bar_index - endBar
+                    
+                    if startBack >= 0 and startBack < 5000 and 
+                       endBack >= 0 and endBack < 5000
+                        
+                        t1 = time[endBack]
+                        
+                        sessionBars = endBar - startBar
+                        extendBack = math.max(endBack - sessionBars, 0)
+                        extendBack := math.min(extendBack, 4999)
+                        
+                        t2 = extendIntoNext ? time[extendBack] : t1
+                        
+                        // POC LINE
+                        pocLine = line.new(
+                            x1 = t1,
+                            y1 = poc,
+                            x2 = t2,
+                            y2 = poc,
+                            xloc = xloc.bar_time,
+                            color = pocColor,
+                            width = pocWidth
+                        )
+                        array.push(pocLines, pocLine)
+                        
+                        // VAH LINE
+                        line.new(
+                            x1 = t1,
+                            y1 = vah,
+                            x2 = t2,
+                            y2 = vah,
+                            xloc = xloc.bar_time,
+                            color = color.green,
+                            width = 0
+                        )
+                        
+                        // VAL LINE
+                        line.new(
+                            x1 = t1,
+                            y1 = val,
+                            x2 = t2,
+                            y2 = val,
+                            xloc = xloc.bar_time,
+                            color = color.red,
+                            width = 0
+                        )
+                        
+                        // Premium/Discount Levels
+                        x = vah - poc
+                        y = poc - val
+                        premium1 = poc + x
+                        discount1 = poc - y
+                        
+                        // P1 LINE
+                        line.new(
+                            x1 = t1,
+                            y1 = premium1,
+                            x2 = t2,
+                            y2 = premium1,
+                            xloc = xloc.bar_time,
+                            color = color.new(color.green, 40),
+                            width = 1,
+                            style = line.style_dashed
+                        )
+                        
+                        // D1 LINE
+                        line.new(
+                            x1 = t1,
+                            y1 = discount1,
+                            x2 = t2,
+                            y2 = discount1,
+                            xloc = xloc.bar_time,
+                            color = color.new(color.red, 40),
+                            width = 1,
+                            style = line.style_dashed
+                        )
+                        
+                        // P1 LABEL
+                        p1Label = label.new(
+                            x = t2,
+                            y = premium1,
+                            text = "P1",
+                            xloc = xloc.bar_time,
+                            style = label.style_label_left,
+                            textcolor = color.white,
+                            color = color.green,
+                            size = size.normal
+                        )
+                        array.push(allLabels, p1Label)
+                        
+                        // D1 LABEL
+                        d1Label = label.new(
+                            x = t2,
+                            y = discount1,
+                            text = "D1",
+                            xloc = xloc.bar_time,
+                            style = label.style_label_left,
+                            textcolor = color.white,
+                            color = color.red,
+                            size = size.normal
+                        )
+                        array.push(allLabels, d1Label)
+    
+    // DRAW LVN LINES & LABELS
+    if showLVN and not na(lvnVAH) and not na(lvnVAL) and not na(lvnSessionStart)
+        
+        if na(lvnSessionEnd) or bar_index <= lvnSessionEnd + 100
+            
+            sessionStartBack = bar_index - lvnSessionStart
+            sessionEndBack = na(lvnSessionEnd) ? 0 : bar_index - lvnSessionEnd
+            
+            sessionStartBack := math.max(sessionStartBack, 0)
+            sessionStartBack := math.min(sessionStartBack, 4999)
+            sessionEndBack := math.max(sessionEndBack, 0)
+            sessionEndBack := math.min(sessionEndBack, 4999)
+            
+            if sessionStartBack >= 0 and sessionEndBack >= 0
+                
+                t_start = time[sessionStartBack]
+                t_end = time[sessionEndBack]
+                
+                // LVN VAH LINE
+                lvnVAHLine = line.new(
+                    x1 = t_start,
+                    y1 = lvnVAH,
+                    x2 = t_end,
+                    y2 = lvnVAH,
+                    xloc = xloc.bar_time,
+                    color = lvnVAHColor,
+                    width = lvnWidth,
+                    style = line.style_solid
+                )
+                array.push(lvnLines, lvnVAHLine)
+                
+                // LVN VAL LINE
+                lvnVALLine = line.new(
+                    x1 = t_start,
+                    y1 = lvnVAL,
+                    x2 = t_end,
+                    y2 = lvnVAL,
+                    xloc = xloc.bar_time,
+                    color = lvnVALColor,
+                    width = lvnWidth,
+                    style = line.style_solid
+                )
+                array.push(lvnLines, lvnVALLine)
+                
+                // LVN LABELS
+                if showLVNLabels
+                    
+                    lvnVAHLabel = label.new(
+                        x = t_end,
+                        y = lvnVAH,
+                        text = str.format("LVN.VAH {0}", str.tostring(lvnVAH, "#.##")),
+                        xloc = xloc.bar_time,
+                        style = label.style_label_left,
+                        textcolor = color.white,
+                        color = color.green,
+                        size = size.normal
+                    )
+                    array.push(allLabels, lvnVAHLabel)
+                    
+                    lvnVALLabel = label.new(
+                        x = t_end,
+                        y = lvnVAL,
+                        text = str.format("LVN.VAL {0}", str.tostring(lvnVAL, "#.##")),
+                        xloc = xloc.bar_time,
+                        style = label.style_label_left,
+                        textcolor = color.white,
+                        color = color.red,
+                        size = size.normal
+                    )
+                    array.push(allLabels, lvnVALLabel)
+
+//=====================================================================
+// PLOTS: DEVELOPING VALUE AREA + DELTA
+//=====================================================================
+
+plot(
+    developingVAH,
+    title = "Developing VAH",
+    color = color.lime,
+    linewidth = 2,
+    style = plot.style_stepline
+)
+
+plot(
+    developingVAL,
+    title = "Developing VAL",
+    color = color.red,
+    linewidth = 2,
+    style = plot.style_stepline
+)
+
+plot(
+    showLVN ? lvnVAH : na,
+    title = "LVN VAH (Last Value)",
+    color = color.new(color.lime, 50),
+    linewidth = 1,
+    display = display.none
+)
+
+plot(
+    showLVN ? lvnVAL : na,
+    title = "LVN VAL (Last Value)",
+    color = color.new(color.red, 50),
+    linewidth = 1,
+    display = display.none
+)
+
+// Session Delta (cumulative buying/selling pressure)
+plot(
+    sessionDelta / 1000000,
+    title = "Session Volume Delta (MM)",
+    color = sessionDelta > 0 ? color.green : color.red,
+    linewidth = 2,
+    style = plot.style_histogram
+)
+
+//=====================================================================
+// ALERTS
+//=====================================================================
+
+alertCondition(
+    lvnVAH != na and close > lvnVAH,
+    title = "Price Above LVN VAH",
+    message = "Alert: Price has moved above LVN VAH"
+)
+
+alertCondition(
+    lvnVAL != na and close < lvnVAL,
+    title = "Price Below LVN VAL",
+    message = "Alert: Price has moved below LVN VAL"
+)

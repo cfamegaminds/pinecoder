@@ -1,0 +1,25 @@
+{
+  "extraKnownMarketplaces": {
+    "caveman": {
+      "source": {
+        "source": "github",
+        "repo": "JuliusBrussee/caveman"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "caveman@caveman": true
+  },
+  "env": {
+    "ANTHROPIC_API_KEY": "sk-jvj8BClAcJvSghZ8RqxXRRD0697ArW5i0mXMj2vngBAA1mF4",
+    "ANTHROPIC_BASE_URL": "https://agentrouter.org",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": []
+  },
+  "apiKeyHelper": "echo 'sk-jvj8BClAcJvSghZ8RqxXRRD0697ArW5i0mXMj2vngBAA1mF4'",
+  "effortLevel": "low",
+  "model": "haiku"
+}

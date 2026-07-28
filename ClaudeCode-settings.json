@@ -1,0 +1,29 @@
+{
+  "extraKnownMarketplaces": {
+    "caveman": {
+      "source": {
+        "source": "github",
+        "repo": "JuliusBrussee/caveman"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "caveman@caveman": true
+  },
+  "env": {
+    "ANTHROPIC_API_KEY": "fe_oa_eaf642c9efdd8cb25fbf5c40f6d9f6b0195e090e44c712f0",
+    "ANTHROPIC_BASE_URL": "https://cc.freemodel.dev",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": []
+  },
+  "apiKeyHelper": "echo 'fe_oa_eaf642c9efdd8cb25fbf5c40f6d9f6b0195e090e44c712f0'",
+  "effortLevel": "low",
+  "model": "haiku"
+}
+
+
+
+

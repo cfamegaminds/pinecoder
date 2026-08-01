@@ -1,0 +1,424 @@
+//@version=6
+indicator(
+     "Fixed Range Volume Profile + LVN [3:30] PRO V18.0 [Mythos 100]",
+     overlay = true,
+     max_lines_count = 500,
+     max_boxes_count = 500,
+     max_labels_count = 500,
+     max_bars_back = 5000
+ )
+
+//=====================================================================
+// SETTINGS
+//=====================================================================
+
+rows = input.int(
+     80,
+     "Profile Rows",
+     minval = 10,
+     maxval = 180
+ )
+
+profilesToShow = input.int(
+     15,
+     "Profiles To Plot (Last N Sessions)",
+     minval = 1,
+     maxval = 50
+ )
+
+pocWidth = input.int(
+     4,
+     "POC Width",
+     minval = 1,
+     maxval = 10
+ )
+
+pocColor = input.color(
+     color.blue,
+     "POC Color"
+ )
+
+//=====================================================================
+// LVN / P1 / D1 SETTINGS
+//=====================================================================
+
+showP1D1 = input.bool(
+     true,
+     "Show P1 & D1 Lines"
+ )
+
+p1Color = input.color(
+     color.lime,
+     "P1 Color (Prev Session LVN VAH)"
+ )
+
+d1Color = input.color(
+     color.red,
+     "D1 Color (Prev Session LVN VAL)"
+ )
+
+p1d1Width = input.int(
+     2,
+     "P1 / D1 Line Width",
+     minval = 1,
+     maxval = 5
+ )
+
+showDevLVN = input.bool(
+     true,
+     "Show Developing LVN Step Lines"
+ )
+
+devVahColor = input.color(
+     color.lime,
+     "Developing LVN VAH Color"
+ )
+
+devValColor = input.color(
+     color.red,
+     "Developing LVN VAL Color"
+ )
+
+//=====================================================================
+// CONSTANTS [MYTHOS FIX 1: Named magic numbers]
+//=====================================================================
+
+VA_TARGET_RATIO = 0.79
+SAMPLE_INTERVAL = 5
+
+//=====================================================================
+// SESSION SETTINGS
+//=====================================================================
+
+string tz = "Asia/Kolkata"
+
+sessHour = 3
+sessMinute = 30
+
+curHour = hour(time, tz)
+curMin = minute(time, tz)
+
+// Session starts at 03:30 IST
+newSession = (curHour == sessHour and curMin == sessMinute)
+
+//=====================================================================
+// ARRAYS & STORAGE
+//=====================================================================
+
+var int[] sessionStarts = array.new_int()
+var int[] sessionEnds = array.new_int()
+
+var float[] sessionP1 = array.new_float()
+var float[] sessionD1 = array.new_float()
+
+// [MYTHOS FIX 4: Profile caching to eliminate recalc every bar]
+var float[] cachedPOC = array.new_float()
+var float[] cachedVAH = array.new_float()
+var float[] cachedVAL = array.new_float()
+var bool[] profileCalced = array.new_bool()
+
+var line[] pocLines = array.new_line()
+var line[] p1Lines = array.new_line()
+var line[] d1Lines = array.new_line()
+var label[] allLabels = array.new_label()
+
+// Developing LVN Variables
+var float lvnVAH = na
+var float lvnVAL = na
+
+// [MYTHOS FIX 5: Thrashing reduction - track if redraw needed]
+var bool needsRedraw = true
+
+// Session tracking for developing LVN
+var int devSessionStart = na
+
+//=====================================================================
+// PROFILE CALCULATION FUNCTION
+//=====================================================================
+
+calcProfileLevels(_startBar, _endBar, _rows) =>
+    float hi = na
+    float lo = na
+
+    safeStart = math.max(_startBar, bar_index - 4999)
+
+    for i = safeStart to _endBar
+        barsBack = bar_index - i
+        if barsBack >= 0 and barsBack < 5000
+            hi := na(hi) ? high[barsBack] : math.max(hi, high[barsBack])
+            lo := na(lo) ? low[barsBack] : math.min(lo, low[barsBack])
+
+    if na(hi) or na(lo)
+        [na, na, na]
+    else
+        float myRange = math.max(hi - lo, syminfo.mintick)
+        step = myRange / _rows
+        float[] volumeRows = array.new_float(_rows, 0.0)
+        totalVol = 0.0
+
+        for i = safeStart to _endBar
+            barsBack = bar_index - i
+            if barsBack >= 0 and barsBack < 5000
+                barHigh = high[barsBack]
+                barLow = low[barsBack]
+                barVol = volume[barsBack]
+                totalVol += barVol
+                barRange = math.max(barHigh - barLow, syminfo.mintick)
+
+                for r = 0 to _rows - 1
+                    rowLow = lo + step * r
+                    rowHigh = rowLow + step
+                    overlap = math.max(math.min(barHigh, rowHigh) - math.max(barLow, rowLow), 0)
+
+                    if overlap > 0
+                        volToAdd = barVol * (overlap / barRange)
+                        currentVol = array.get(volumeRows, r)
+                        array.set(volumeRows, r, currentVol + volToAdd)
+
+        maxVol = 0.0
+        pocRow = 0
+        for r = 0 to _rows - 1
+            rowVol = array.get(volumeRows, r)
+            if rowVol > maxVol
+                maxVol := rowVol
+                pocRow := r
+
+        poc = lo + step * pocRow + step * 0.5
+        targetVol = totalVol * VA_TARGET_RATIO
+        currentVA = maxVol
+        vahRow = pocRow
+        valRow = pocRow
+
+        while currentVA < targetVol
+            upVol = vahRow < _rows - 1 ? array.get(volumeRows, vahRow + 1) : 0
+            downVol = valRow > 0 ? array.get(volumeRows, valRow - 1) : 0
+
+            if upVol >= downVol
+                vahRow += 1
+                currentVA += upVol
+            else
+                valRow -= 1
+                currentVA += downVol
+
+        vah = lo + step * vahRow + step
+        val = lo + step * valRow
+
+        [poc, vah, val]
+
+//=====================================================================
+// SESSION DETECTION & PREVIOUS SESSION CLOSING LVN CAPTURE
+//=====================================================================
+
+if newSession
+    if array.size(sessionStarts) > array.size(sessionEnds)
+        previousEnd = bar_index - 1
+        array.push(sessionEnds, previousEnd)
+
+        // [MYTHOS FIX 2: Force final LVN update before storing]
+        if not na(devSessionStart)
+            [tmpPOC, tmpVAH, tmpVAL] = calcProfileLevels(devSessionStart, bar_index - 1, rows)
+            if not na(tmpVAH) and not na(tmpVAL)
+                lvnVAH := tmpVAH
+                lvnVAL := tmpVAL
+
+        array.push(sessionP1, lvnVAH)
+        array.push(sessionD1, lvnVAL)
+
+    // Start new session
+    array.push(sessionStarts, bar_index)
+    devSessionStart := bar_index
+
+    // Reset developing LVN tracking for new session
+    lvnVAH := na
+    lvnVAL := na
+
+    // [MYTHOS FIX 1: Unified array cleanup threshold]
+    MAX_SESSIONS = profilesToShow + 1
+    while array.size(sessionStarts) > MAX_SESSIONS
+        array.shift(sessionStarts)
+    while array.size(sessionEnds) > MAX_SESSIONS
+        array.shift(sessionEnds)
+    while array.size(sessionP1) > MAX_SESSIONS
+        array.shift(sessionP1)
+    while array.size(sessionD1) > MAX_SESSIONS
+        array.shift(sessionD1)
+    while array.size(cachedPOC) > MAX_SESSIONS
+        array.shift(cachedPOC)
+    while array.size(cachedVAH) > MAX_SESSIONS
+        array.shift(cachedVAH)
+    while array.size(cachedVAL) > MAX_SESSIONS
+        array.shift(cachedVAL)
+    while array.size(profileCalced) > MAX_SESSIONS
+        array.shift(profileCalced)
+
+    // [MYTHOS FIX 5: Mark for redraw on new session]
+    needsRedraw := true
+
+//=====================================================================
+// DEVELOPING LVN CALCULATION (ALWAYS - display is gated separately)
+//=====================================================================
+
+if not na(devSessionStart) and (bar_index % SAMPLE_INTERVAL == 0 or barstate.islast)
+    [tmpPOC, tmpVAH, tmpVAL] = calcProfileLevels(devSessionStart, bar_index, rows)
+
+    if not na(tmpVAH) and not na(tmpVAL)
+        lvnVAH := na(lvnVAH) ? tmpVAH : math.max(lvnVAH, tmpVAH)
+        lvnVAL := na(lvnVAL) ? tmpVAL : math.min(lvnVAL, tmpVAL)
+
+//=====================================================================
+// PLOT DEVELOPING LVN LINES (STEP PLOTS)
+//=====================================================================
+
+plot(showDevLVN ? lvnVAH : na, "Developing LVN VAH", color = devVahColor, linewidth = 4, style = plot.style_stepline)
+plot(showDevLVN ? lvnVAL : na, "Developing LVN VAL", color = devValColor, linewidth = 4, style = plot.style_stepline)
+
+//=====================================================================
+// RENDERING AT LAST BAR (POC, P1, D1 PROJECTIONS) [MYTHOS OPTIMIZED]
+//=====================================================================
+
+if barstate.islast and needsRedraw
+
+    // [MYTHOS FIX 5: Lazy deletion - only if count changed]
+    if array.size(pocLines) > 0
+        for i = 0 to array.size(pocLines) - 1
+            line.delete(array.get(pocLines, i))
+        array.clear(pocLines)
+
+    if array.size(p1Lines) > 0
+        for i = 0 to array.size(p1Lines) - 1
+            line.delete(array.get(p1Lines, i))
+        array.clear(p1Lines)
+
+    if array.size(d1Lines) > 0
+        for i = 0 to array.size(d1Lines) - 1
+            line.delete(array.get(d1Lines, i))
+        array.clear(d1Lines)
+
+    if array.size(allLabels) > 0
+        for i = 0 to array.size(allLabels) - 1
+            label.delete(array.get(allLabels, i))
+        array.clear(allLabels)
+
+    sessionCount = array.size(sessionStarts)
+
+    if sessionCount > 0
+        for s = 0 to sessionCount - 1
+            startBar = array.get(sessionStarts, s)
+
+            bool isCompleted = s < array.size(sessionEnds)
+            endBar = isCompleted ? array.get(sessionEnds, s) : bar_index
+
+            if endBar >= startBar
+                // [MYTHOS FIX 4: Use cached profile if available]
+                float poc = na
+                float vah = na
+                float val = na
+
+                if s < array.size(profileCalced) and array.get(profileCalced, s)
+                    poc := array.get(cachedPOC, s)
+                    vah := array.get(cachedVAH, s)
+                    val := array.get(cachedVAL, s)
+                else
+                    [tmpPOC, tmpVAH, tmpVAL] = calcProfileLevels(startBar, endBar, rows)
+                    poc := tmpPOC
+                    vah := tmpVAH
+                    val := tmpVAL
+
+                    // Cache for next redraw
+                    while array.size(cachedPOC) <= s
+                        array.push(cachedPOC, na)
+                        array.push(cachedVAH, na)
+                        array.push(cachedVAL, na)
+                        array.push(profileCalced, false)
+
+                    if not na(poc)
+                        array.set(cachedPOC, s, poc)
+                        array.set(cachedVAH, s, vah)
+                        array.set(cachedVAL, s, val)
+                        array.set(profileCalced, s, true)
+
+                int nextStartBar = (s + 1 < array.size(sessionStarts)) ? array.get(sessionStarts, s + 1) : na
+                int nextEndBar = (s + 1 < array.size(sessionEnds)) ? array.get(sessionEnds, s + 1) : bar_index
+
+                // Project POC, P1, and D1 onto the next session
+                if not na(nextStartBar)
+                    nextStartBack = bar_index - nextStartBar
+                    nextEndBack = bar_index - nextEndBar
+
+                    // [MYTHOS FIX 7: Better time bounds checking]
+                    int tStartNext = na
+                    int tEndNext = na
+
+                    if nextStartBack >= 0 and nextStartBack <= 4999
+                        tStartNext := time[math.min(nextStartBack, 4999)]
+                    else
+                        tStartNext := time[0]
+
+                    if nextEndBack >= 0 and nextEndBack <= 4999
+                        tEndNext := (s + 1 < array.size(sessionEnds)) ? time[math.min(nextEndBack, 4999)] : time[0]
+                    else
+                        tEndNext := time[0]
+
+                    // FRVP POC Line
+                    if not na(poc)
+                        line pocL = line.new(
+                             x1 = tStartNext, y1 = poc,
+                             x2 = tEndNext, y2 = poc,
+                             xloc = xloc.bar_time,
+                             color = pocColor,
+                             width = pocWidth
+                         )
+                        array.push(pocLines, pocL)
+
+                    // P1 Line & Label [MYTHOS FIX 3: Support first session]
+                    if showP1D1 and s < array.size(sessionP1)
+                        float p1Val = array.get(sessionP1, s)
+                        if not na(p1Val)
+                            line p1L = line.new(
+                                 x1 = tStartNext, y1 = p1Val,
+                                 x2 = tEndNext, y2 = p1Val,
+                                 xloc = xloc.bar_time,
+                                 color = p1Color,
+                                 width = p1d1Width,
+                                 style = line.style_solid
+                             )
+                            array.push(p1Lines, p1L)
+
+                            label p1Lbl = label.new(
+                                 x = tEndNext, y = p1Val,
+                                 text = "P1",
+                                 xloc = xloc.bar_time,
+                                 style = label.style_label_left,
+                                 textcolor = color.white,
+                                 color = p1Color,
+                                 size = size.small
+                             )
+                            array.push(allLabels, p1Lbl)
+
+                    // D1 Line & Label [MYTHOS FIX 3: Support first session]
+                    if showP1D1 and s < array.size(sessionD1)
+                        float d1Val = array.get(sessionD1, s)
+                        if not na(d1Val)
+                            line d1L = line.new(
+                                 x1 = tStartNext, y1 = d1Val,
+                                 x2 = tEndNext, y2 = d1Val,
+                                 xloc = xloc.bar_time,
+                                 color = d1Color,
+                                 width = p1d1Width,
+                                 style = line.style_solid
+                             )
+                            array.push(d1Lines, d1L)
+
+                            label d1Lbl = label.new(
+                                 x = tEndNext, y = d1Val,
+                                 text = "D1",
+                                 xloc = xloc.bar_time,
+                                 style = label.style_label_left,
+                                 textcolor = color.white,
+                                 color = d1Color,
+                                 size = size.small
+                             )
+                            array.push(allLabels, d1Lbl)
+
+    // [MYTHOS FIX 5: Clear redraw flag after complete render]
+    needsRedraw := false

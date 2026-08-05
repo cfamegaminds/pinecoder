@@ -1,0 +1,895 @@
+//@version=6
+indicator(
+ "POCX2 + FRVP [3:30] LVN + Liquidity Heatmap V25.0 [PRODUCTION] MTF15 Locked",
+ overlay = true,
+ max_lines_count = 500,
+ max_boxes_count = 500,
+ max_labels_count = 500,
+ max_polylines_count = 100,
+ max_bars_back = 5000
+ )
+//======================================================
+// NAMED CONSTANTS
+//======================================================
+int MAX_BARS_BACK = 5000
+float VA_TARGET = 0.79
+int MAX_HIST_SESSIONS = 30
+int DAY_RECALC_STRIDE = 3
+int WEEK_RECALC_STRIDE = 5
+int TWMA_FAST = 1296
+int TWMA_MID = 1369
+int TWMA_SLOW = 1440
+//======================================================
+// PERFORMANCE OPTIMIZATION: Dynamic bin count
+//======================================================
+tf_str = timeframe.period
+tf_1m = tf_str == "1" or tf_str == "1S"
+tf_5m = tf_str == "5" or tf_str == "5S"
+tf_15m = tf_str == "15" or tf_str == "15S"
+tf_1h = tf_str == "60" or tf_str == "1H"
+tf_4h = tf_str == "240" or tf_str == "4H"
+is_lower_tf = tf_1m or tf_5m or tf_15m
+is_mid_tf = tf_1h
+dynamic_bins = is_lower_tf ? 120 : is_mid_tf ? 240 : 480
+//======================================================
+// POCR2 INPUTS
+//======================================================
+minBars = input.int(1, "Minimum Bars Required", minval = 1, group = "POCR2")
+binsCount = input.int(480, "Volume Profile Bins", minval = 10, maxval = 500, group = "POCR2")
+pocThreshold = input.float(0.0, "POC Update Threshold %", step = 0.01, group = "POCR2")
+smoothedLength = input.int(60, "POC Smoothing Length", minval = 1, group = "POCR2")
+updateMinutes = input.int(1440, "POC Update Interval (Minutes)", minval = 1, group = "POCR2")
+pocDayColor = input.color(color.black, "POC(Day) Color", group = "POCR2")
+pocDayWidth = input.int(5, "POC(Day) Line Width", minval = 1, maxval = 10, group = "POCR2")
+pocWeekColor = input.color(color.black, "POC(Week) Color", group = "POCR2")
+pocWeekWidth = input.int(6, "POC(Week) Line Width", minval = 1, maxval = 10, group = "POCR2")
+vaPercent = input.float(79.0, "VA Target %", minval = 50.0, maxval = 99.0, step = 1.0, group = "POCR2")
+//======================================================
+// FRVP INPUTS
+//======================================================
+rows = input.int(80, "Profile Rows", minval = 10, maxval = 180, group = "FRVP")
+profilesToShow = input.int(15, "Profiles To Plot", minval = 1, maxval = 50, group = "FRVP")
+pocSessionWidth = input.int(6, "POC(Session) Width", minval = 1, maxval = 10, group = "FRVP")
+pocSessionColor = input.color(color.blue, "POC(Session_FRVP) Color", group = "FRVP")
+extendIntoNext = input.bool(false, "Extend POC Across Next Session", group = "FRVP")
+showLVN = input.bool(true, "Show LVN (Last Value Normal)", group = "FRVP")
+lvnVAHColor = input.color(color.new(color.lime, 30), "LVN VAH Color", group = "FRVP")
+lvnVALColor = input.color(color.new(color.red, 30), "LVN VAL Color", group = "FRVP")
+lvnWidth = input.int(3, "LVN Line Width", minval = 1, maxval = 5, group = "FRVP")
+showLVNLabels = input.bool(true, "Show LVN Labels", group = "FRVP")
+//======================================================
+// FRVP SESSION SETTINGS
+//======================================================
+string tz = input.string("Asia/Kolkata", "Session Timezone", group = "FRVP")
+sessHour = input.int(3, "Session Start Hour", minval = 0, maxval = 23, group = "FRVP")
+sessMinute = input.int(30, "Session Start Minute", minval = 0, maxval = 59, group = "FRVP")
+curHour = hour(time, tz)
+curMin = minute(time, tz)
+newSession = (curHour == sessHour and curMin == sessMinute)
+//======================================================
+// LIQUIDITY HEATMAP INPUTS
+//======================================================
+color HEAT_HIGH = color.rgb(255, 0, 0)
+color HEAT_MID = color.rgb(255, 140, 0)
+color HEAT_LOW = color.rgb(255, 215, 0)
+string heatTimeframeInput = input.timeframe("W", "HTF Setting", group = "Liquidity Heatmap")
+bool showHeatmap = input.bool(false, "Show Liquidity Heatmap", group = "Liquidity Heatmap")
+int heatRows = input.int(180, "Heatmap Rows", minval = 10, maxval = 360, group = "Liquidity Heatmap")
+int heatWidth = input.int(25, "Heatmap Width", minval = 5, maxval = 180, group = "Liquidity Heatmap")
+float heatOpacity = input.float(85.0, "Heatmap Opacity", minval = 0, maxval = 100, step = 1, group = "Liquidity Heatmap")
+bool showHeatPOC = input.bool(false, "Show Developing HTF POC", group = "Liquidity Heatmap")
+bool extendHeatPOC = input.bool(false, "Extend HTF POC Right", group = "Liquidity Heatmap")
+int heatPocWidth = input.int(5, "HTF POC Width", minval = 1, maxval = 10, group = "Liquidity Heatmap")
+color heatPocColor = input.color(color.rgb(200, 5, 200), "HTF POC Color", group = "Liquidity Heatmap")
+//======================================================
+// LIQUIDITY INPUTS [SIMPLIFIED]
+//======================================================
+bool showLiquidityLevels = input.bool(true, "Show Buyside/Sellside Liquidity", group = "Liquidity Levels")
+color buyLiqColor = input.color(color.new(color.green, 0), "Buyside Liquidity Color", group = "Liquidity Levels")
+color sellLiqColor = input.color(color.new(color.red, 0), "Sellside Liquidity Color", group = "Liquidity Levels")
+int liqLineWidth = input.int(3, "Liquidity Line Width", minval = 1, maxval = 5, group = "Liquidity Levels")
+bool showLiqTable = input.bool(true, "Show Liquidity Table", group = "Liquidity Levels")
+string liqTablePos = input.string("top_right", "Table Position", options = ["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"], group = "Liquidity Levels")
+string liqTableSize = input.string("small", "Table Text Size", options = ["small", "normal", "large"], group = "Liquidity Levels")
+bool showBarColor = input.bool(true, "Show Bar Coloring", group = "Liquidity Levels")
+//======================================================
+// KEY LEVELS TABLE INPUTS
+//======================================================
+bool showKeyLevelsTable = input.bool(true, "Show Key Levels Table", group = "Key Levels")
+string keyLevelsPos = input.string("middle_right", "Key Levels Position", options = ["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"], group = "Key Levels")
+string keyLevelsSize = input.string("small", "Key Levels Text Size", options = ["small", "normal", "large"], group = "Key Levels")
+//======================================================
+// WEIGHTAGE BOX INPUTS
+//======================================================
+bool showWeightBox = input.bool(true, "Show POC Weightage Box", group = "Weightage Box")
+int wDayPoc = input.int(2, "Weight: POCR2 Daily POC", minval = 0, group = "Weightage Box")
+int wWeekPoc = input.int(5, "Weight: POCR2 Weekly POC", minval = 0, group = "Weightage Box")
+float wSessionFrvp = input.float(2.5, "Weight: POC(Session_FRVP)", minval = 0, group = "Weightage Box")
+int wHtfPoc = input.int(5, "Weight: HTF POC", minval = 0, group = "Weightage Box")
+float wP1 = input.float(1.5, "Weight: P1 Level", minval = 0, group = "Weightage Box")
+float wD1 = input.float(1.5, "Weight: D1 Level", minval = 0, group = "Weightage Box")
+float wAnchor = input.float(1.5, "Weight: Anchor (DayOpenLevel)", minval = 0, group = "Weightage Box")
+float wTwmaTrend = input.float(2.0, "Weight: TWMA Trend Signal", minval = 0, group = "Weightage Box")
+string liquidityMtfTf = input.timeframe("15", "Liquidity Calc Timeframe (MTF)", group = "Weightage Box")
+bool liqConfirmOnly = input.bool(true, "Liquidity: Commit On Confirmed Bar (non-repaint)", group = "Liquidity Confluence")
+float confTolerance = input.float(0.5, "POC Confluence Tolerance %", minval = 0.1, maxval = 2.0, step = 0.1, group = "Liquidity Confluence")
+bool showHistoricalLiq = input.bool(true, "Show Historical Liquidity (30 sessions)", group = "Liquidity Confluence")
+//======================================================
+// ALERT INPUTS
+//======================================================
+bool enableAlerts = input.bool(true, "Enable Alerts", group = "Alerts")
+bool alertCrossLiq = input.bool(true, "Alert: Price Cross Liquidity", group = "Alerts")
+bool alertDailyWeeklyConf = input.bool(true, "Alert: Daily-Weekly POC Confluence", group = "Alerts")
+bool alertLVNEnter = input.bool(true, "Alert: Price Enter LVN Band", group = "Alerts")
+bool alertBiasFlip = input.bool(true, "Alert: Bias Flip", group = "Alerts")
+bool alertTwmaConfluence = input.bool(true, "Alert: TWMA Trend Confluence", group = "Alerts")
+//======================================================
+// RISK/REWARD INPUTS
+//======================================================
+bool showRiskReward = input.bool(true, "Show Risk/Reward Panel", group = "Risk Management")
+float accountSize = input.float(10000, "Account Size ($)", minval = 100, group = "Risk Management")
+float riskPercent = input.float(1.0, "Risk Per Trade %", minval = 0.1, maxval = 5.0, step = 0.1, group = "Risk Management")
+float rewardMultiplier = input.float(3.0, "Reward Multiplier (1:X)", minval = 1.0, maxval = 10.0, step = 0.5, group = "Risk Management")
+//======================================================
+// INPUT VALIDATION
+//======================================================
+effective_bins = math.min(math.max(10, binsCount), 500)
+effective_rows = math.min(math.max(10, rows), 180)
+effective_heat_rows = math.min(math.max(10, heatRows), 360)
+effective_profiles = math.min(math.max(1, profilesToShow), 50)
+effective_va_target = vaPercent / 100.0
+//======================================================
+// f_binnedPoc [OPTIMIZED]
+//======================================================
+f_binnedPoc(_hi, _lo, _len, _bins, _maxScan) =>
+ if _len < minBars or _hi <= _lo
+ na
+ else
+ myRange = _hi - _lo
+ myStep = myRange / _bins
+ if myStep <= 0
+ na
+ else
+ var float[] binsVol = array.new_float(_bins, 0.0)
+ array.fill(binsVol, 0.0)
+ barsToScan = math.min(_len, math.min(_maxScan, 5000))
+ for i = 0 to barsToScan - 1
+ price = close[i]
+ vol = volume[i]
+ index = math.floor((price - _lo) / myStep)
+ index := math.max(0, math.min(_bins - 1, index))
+ prevVol = array.get(binsVol, index)
+ array.set(binsVol, index, prevVol + vol)
+ maxVol = array.max(binsVol)
+ pocIndex = array.indexof(binsVol, maxVol)
+ if pocIndex >= 0
+ _lo + (myStep * pocIndex) + (myStep / 2)
+ else
+ na
+//======================================================
+// POCR2: DAILY POC
+//======================================================
+isNewDay = timeframe.change("D")
+var int daySegmentStart = bar_index
+var float dayOpenLevel = na
+var float cachedDayPoc = na
+var int lastDayUpdate = 0
+if isNewDay
+ daySegmentStart := bar_index
+ dayOpenLevel := open
+ cachedDayPoc := na
+ lastDayUpdate := 0
+daySegmentLength = bar_index - daySegmentStart + 1
+dayHigh = ta.highest(high, daySegmentLength)
+dayLow = ta.lowest(low, daySegmentLength)
+float rawDayPoc = na
+if daySegmentLength >= minBars and dayHigh > dayLow and (lastDayUpdate == 0 or bar_index % DAY_RECALC_STRIDE == 0)
+ rawDayPoc := f_binnedPoc(dayHigh, dayLow, daySegmentLength, effective_bins, MAX_BARS_BACK)
+ if not na(rawDayPoc)
+ cachedDayPoc := rawDayPoc
+ lastDayUpdate := bar_index
+var float stableDayPoc = na
+if isNewDay
+ stableDayPoc := na
+if not na(cachedDayPoc) and na(stableDayPoc)
+ stableDayPoc := cachedDayPoc
+//======================================================
+// POCR2: WEEKLY POC
+//======================================================
+isNewWeek = timeframe.change("W")
+var int weekSegmentStart = bar_index
+var float cachedWeekPoc = na
+var int lastWeekUpdate = 0
+if isNewWeek
+ weekSegmentStart := bar_index
+ cachedWeekPoc := na
+ lastWeekUpdate := 0
+weekSegmentLength = bar_index - weekSegmentStart + 1
+weekHigh = ta.highest(high, weekSegmentLength)
+weekLow = ta.lowest(low, weekSegmentLength)
+float rawWeekPoc = na
+if weekSegmentLength >= minBars and weekHigh > weekLow and (lastWeekUpdate == 0 or bar_index % WEEK_RECALC_STRIDE == 0)
+ rawWeekPoc := f_binnedPoc(weekHigh, weekLow, weekSegmentLength, effective_bins, MAX_BARS_BACK)
+ if not na(rawWeekPoc)
+ cachedWeekPoc := rawWeekPoc
+ lastWeekUpdate := bar_index
+var float stableWeekPoc = na
+if isNewWeek
+ stableWeekPoc := na
+if not na(cachedWeekPoc) and na(stableWeekPoc)
+ stableWeekPoc := cachedWeekPoc
+//======================================================
+// FRVP: SESSION ARRAYS
+//======================================================
+var int[] sessionStarts = array.new_int()
+var int[] sessionEnds = array.new_int()
+var line[] pocLines = array.new_line()
+var line[] lvnLines = array.new_line()
+var label[] allLabels = array.new_label()
+var float developingVAH = na
+var float developingVAL = na
+var float lvnVAH = na
+var float lvnVAL = na
+var int lvnSessionStart = na
+var int lvnSessionEnd = na
+var float latestSessionFrvpPoc = na
+var float allLabels_holder = na
+var int lockedSessionBar = na
+var float dispBuySideLiquidity = na
+var float dispSellSideLiquidity = na
+var string dispBuySideName = ""
+var string dispSellSideName = ""
+var bool dailyWeeklyConfluence = false
+var bool twmaConfluence = false
+var bool confluenceActive = false
+var string prevBias = ""
+//======================================================
+// SESSION-LOCKED LIQUIDITY [MTF15 CONSISTENCY FIX]
+//======================================================
+var float lockedSessionVAL = na
+var float lockedSessionVAH = na
+var int lockedSessionStartBar = na
+var bool sessionLocked = false
+//======================================================
+// TWMA TREND STATE (INTEGRATION)
+//======================================================
+var bool twmaTrendActive = false
+var string twmaTrendDirection = ""
+//======================================================
+// HISTORICAL LIQUIDITY TRACKING
+//======================================================
+var float[] histBuySideLiq = array.new_float()
+var float[] histSellSideLiq = array.new_float()
+var int[] histSessionTime = array.new_int()
+var label[] histBuySideLabels = array.new_label()
+var label[] histSellSideLabels = array.new_label()
+var line[] histBuySideLines = array.new_line()
+var line[] histSellSideLines = array.new_line()
+//======================================================
+// FRVP: SESSION DETECTION
+//======================================================
+if newSession
+ if array.size(sessionStarts) > array.size(sessionEnds)
+ previousEnd = bar_index - 1
+ array.push(sessionEnds, previousEnd)
+ array.push(sessionStarts, bar_index)
+ while array.size(sessionStarts) > effective_profiles + 1
+ array.shift(sessionStarts)
+ while array.size(sessionEnds) > effective_profiles
+ array.shift(sessionEnds)
+ lockedSessionStartBar := bar_index
+ sessionLocked := false
+//======================================================
+// FRVP: PROFILE CALCULATION [OPTIMIZED]
+//======================================================
+calcProfileLevels(_startBar, _endBar, _rows) =>
+ float hi = na
+ float lo = na
+ safeStart = math.max(_startBar, bar_index - 4999)
+ safeEnd = math.min(_endBar, bar_index)
+ for i = safeStart to safeEnd
+ barsBack = bar_index - i
+ if barsBack >= 0 and barsBack < 5000
+ hi := na(hi) ? high[barsBack] : math.max(hi, high[barsBack])
+ lo := na(lo) ? low[barsBack] : math.min(lo, low[barsBack])
+ if na(hi) or na(lo)
+ [na, na, na]
+ else
+ myRange = math.max(hi - lo, syminfo.mintick)
+ step = myRange / _rows
+ var float[] volumeRows = array.new_float(_rows, 0.0)
+ array.fill(volumeRows, 0.0)
+ totalVol = 0.0
+ for i = safeStart to safeEnd
+ barsBack = bar_index - i
+ if barsBack >= 0 and barsBack < 5000
+ barHigh = high[barsBack]
+ barLow = low[barsBack]
+ barVol = volume[barsBack]
+ totalVol += barVol
+ barRange = math.max(barHigh - barLow, syminfo.mintick)
+ for r = 0 to _rows - 1
+ rowLow = lo + step * r
+ rowHigh = rowLow + step
+ overlap = math.max(math.min(barHigh, rowHigh) - math.max(barLow, rowLow), 0)
+ if overlap > 0
+ volToAdd = barVol * (overlap / barRange)
+ currentVol = array.get(volumeRows, r)
+ array.set(volumeRows, r, currentVol + volToAdd)
+ maxVol = 0.0
+ pocRow = 0
+ for r = 0 to _rows - 1
+ rowVol = array.get(volumeRows, r)
+ if rowVol > maxVol
+ maxVol := rowVol
+ pocRow := r
+ poc = lo + step * pocRow + step * 0.5
+ targetVol = totalVol * effective_va_target
+ currentVA = maxVol
+ vahRow = pocRow
+ valRow = pocRow
+ while currentVA < targetVol
+ upVol = vahRow < _rows - 1 ? array.get(volumeRows, vahRow + 1) : 0
+ downVol = valRow > 0 ? array.get(volumeRows, valRow - 1) : 0
+ if upVol >= downVol
+ vahRow += 1
+ currentVA += upVol
+ else
+ valRow -= 1
+ currentVA += downVol
+ vah = lo + step * vahRow + step
+ val = lo + step * valRow
+ [poc, vah, val]
+//======================================================
+// FRVP CLOSED-SESSION CACHE
+//======================================================
+var int[] frvpCacheEnd = array.new_int()
+var float[] frvpCachePoc = array.new_float()
+var float[] frvpCacheVah = array.new_float()
+var float[] frvpCacheVal = array.new_float()
+f_getCachedProfile(_startBar, _endBar, _rows) =>
+ idx = array.indexof(frvpCacheEnd, _endBar)
+ float poc = na
+ float vah = na
+ float val = na
+ if idx >= 0
+ poc := array.get(frvpCachePoc, idx)
+ vah := array.get(frvpCacheVah, idx)
+ val := array.get(frvpCacheVal, idx)
+ else
+ [p, vh, vl] = calcProfileLevels(_startBar, _endBar, _rows)
+ poc := p
+ vah := vh
+ val := vl
+ if not na(p)
+ array.push(frvpCacheEnd, _endBar)
+ array.push(frvpCachePoc, p)
+ array.push(frvpCacheVah, vh)
+ array.push(frvpCacheVal, vl)
+ while array.size(frvpCacheEnd) > effective_profiles + 5
+ array.shift(frvpCacheEnd)
+ array.shift(frvpCachePoc)
+ array.shift(frvpCacheVah)
+ array.shift(frvpCacheVal)
+ [poc, vah, val]
+//======================================================
+// LIQUIDITY MTF [GATED ON TF CHANGE]
+//======================================================
+var string lastMtfTf = na
+var float cachedMtfDayPoc = na
+var float cachedMtfWeekPoc = na
+var float cachedMtfSessionPoc = na
+var float cachedMtfHtfPoc = na
+if barstate.islast and (na(lastMtfTf) or lastMtfTf != liquidityMtfTf)
+ mtfDayPoc = request.security(syminfo.tickerid, liquidityMtfTf, (high + low) / 2)
+ mtfWeekPoc = request.security(syminfo.tickerid, liquidityMtfTf, (high + low) / 2)
+ mtfSessionPoc = request.security(syminfo.tickerid, liquidityMtfTf, close)
+ mtfHtfPoc = request.security(syminfo.tickerid, liquidityMtfTf, close)
+ cachedMtfDayPoc := mtfDayPoc
+ cachedMtfWeekPoc := mtfWeekPoc
+ cachedMtfSessionPoc := mtfSessionPoc
+ cachedMtfHtfPoc := mtfHtfPoc
+ lastMtfTf := liquidityMtfTf
+mtfP1 = na(cachedMtfSessionPoc) ? close : cachedMtfSessionPoc
+mtfD1 = na(cachedMtfSessionPoc) ? close : cachedMtfSessionPoc
+//======================================================
+// FRVP: LOCK LIQUIDITY LEVELS ON SESSION START [MTF15 FIX]
+//======================================================
+devSessionStart = array.size(sessionStarts) > 0 ? array.get(sessionStarts, array.size(sessionStarts) - 1) : na
+if not na(devSessionStart) and (na(lvnSessionStart) or devSessionStart > lvnSessionStart)
+ lvnSessionStart := devSessionStart
+ lvnSessionEnd := na
+ lvnVAH := na
+ lvnVAL := na
+if array.size(sessionEnds) > 0
+ latestSessionEnd = array.get(sessionEnds, array.size(sessionEnds) - 1)
+ if not na(latestSessionEnd) and latestSessionEnd == bar_index - 1
+ lvnSessionEnd := latestSessionEnd
+if not na(devSessionStart) and not sessionLocked
+ [tmpPOC, tmpVAH, tmpVAL] = calcProfileLevels(devSessionStart, bar_index, effective_rows)
+ if not na(tmpVAH) and not na(tmpVAL)
+ lockedSessionVAL := tmpVAL
+ lockedSessionVAH := tmpVAH
+ sessionLocked := true
+ if na(lvnVAH)
+ lvnVAH := tmpVAH
+ else
+ lvnVAH := math.max(lvnVAH, tmpVAH)
+ if na(lvnVAL)
+ lvnVAL := tmpVAL
+ else
+ lvnVAL := math.min(lvnVAL, tmpVAL)
+if not na(devSessionStart) and bar_index % 5 == 0 and sessionLocked
+ developingVAH := lockedSessionVAH
+ developingVAL := lockedSessionVAL
+//======================================================
+// LIQUIDITY HEATMAP: HTF TRACKING
+//======================================================
+bool heatIsNewPeriod = timeframe.change(heatTimeframeInput)
+var float heatHtfHigh = high
+var float heatHtfLow = low
+if heatIsNewPeriod
+ heatHtfHigh := high
+ heatHtfLow := low
+else
+ heatHtfHigh := math.max(heatHtfHigh, high)
+ heatHtfLow := math.min(heatHtfLow, low)
+//======================================================
+// LIQUIDITY HEATMAP: STORAGE [ARRAY BASED + SYNC CHECK]
+//======================================================
+var float[] heatVolArray = array.new_float(360, 0.0)
+var int[] heatBucketMap = array.new_int(360, -1)
+var float[] heatBucketPrices = array.new_float()
+var float heatPocPrice = na
+var float heatMaxVol = 0.0
+var int heatBucketCount = 0
+if heatIsNewPeriod
+ array.fill(heatVolArray, 0.0)
+ array.fill(heatBucketMap, -1)
+ heatBucketPrices.clear()
+ heatPocPrice := na
+ heatMaxVol := 0.0
+ heatBucketCount := 0
+float heatTickSize = syminfo.mintick
+float heatRangeVal = math.max(heatTickSize, heatHtfHigh - heatHtfLow)
+float heatRowSize = math.max(heatTickSize, heatRangeVal / effective_heat_rows)
+float barRange = math.max(high - low, heatTickSize)
+float volToDistribute = volume
+for r = 0 to effective_heat_rows - 1
+ float rowLow = heatHtfLow + heatRowSize * r
+ float rowHigh = rowLow + heatRowSize
+ float overlap = math.max(math.min(high, rowHigh) - math.max(low, rowLow), 0)
+ if overlap > 0
+ float volToAdd = volToDistribute * (overlap / barRange)
+ float rowPrice = rowLow + heatRowSize / 2
+ bucketIdx = array.get(heatBucketMap, r)
+ if bucketIdx < 0
+ bucketIdx := heatBucketCount
+ array.set(heatBucketMap, r, bucketIdx)
+ array.push(heatBucketPrices, rowPrice)
+ heatBucketCount += 1
+ if bucketIdx >= 0 and bucketIdx < 360
+ float newVol = array.get(heatVolArray, bucketIdx) + volToAdd
+ array.set(heatVolArray, bucketIdx, newVol)
+ if newVol > heatMaxVol
+ heatMaxVol := newVol
+ heatPocPrice := rowPrice
+//======================================================
+// LIQUIDITY CALCULATION [SESSION-LOCKED]
+//======================================================
+if newSession
+ dispBuySideLiquidity := sessionLocked ? lockedSessionVAL : close
+ dispSellSideLiquidity := sessionLocked ? lockedSessionVAH : close
+//======================================================
+// TWMA TREND CALCULATION [INTEGRATED]
+//======================================================
+src = close
+w_fast = ta.wma(src, TWMA_FAST)
+w_mid = ta.wma(src, TWMA_MID)
+w_slow = ta.wma(src, TWMA_SLOW)
+r_fast = w_fast > w_fast[1]
+r_mid = w_mid > w_mid[1]
+r_slow = w_slow > w_slow[1]
+allRising = r_fast and r_mid and r_slow
+isFastHighest = (w_fast > w_mid) and (w_fast > w_slow)
+twmaGreen = allRising and isFastHighest
+twmaYellow = allRising and not isFastHighest
+twmaRed = not allRising
+twmaTrendActive := allRising
+twmaTrendDirection := twmaGreen ? "STRONG_BULLISH" : twmaYellow ? "WEAK_BULLISH" : "BEARISH"
+c1 = twmaGreen ? color.green : twmaYellow ? color.yellow : color.red
+c2 = twmaGreen ? color.green : twmaYellow ? color.yellow : color.black
+c3 = twmaGreen ? color.green : twmaYellow ? color.yellow : color.rgb(255, 0, 0)
+//======================================================
+// CONFLUENCE DETECTION [INTEGRATED TWMA]
+//======================================================
+f_checkConfluence() =>
+ bool dw = false
+ if not na(stableDayPoc) and not na(stableWeekPoc) and stableWeekPoc != 0
+ dailyDiff = math.abs(stableDayPoc - stableWeekPoc) / stableWeekPoc * 100
+ dw := dailyDiff <= confTolerance
+ dw
+f_checkTwmaConfluence() =>
+ bool tc = false
+ if twmaTrendActive and (twmaGreen or twmaYellow)
+ tc := true
+ tc
+dailyWeeklyConfluence := f_checkConfluence()
+twmaConfluence := f_checkTwmaConfluence()
+confluenceActive := dailyWeeklyConfluence or twmaConfluence
+//======================================================
+// SESSION-START: UPDATE DISPLAY & TRACK HISTORY
+//======================================================
+if newSession
+ lockedSessionBar := bar_index
+ dispBuySideName := confluenceActive ? "✓" : ""
+ dispSellSideName := confluenceActive ? "✓" : ""
+ array.push(histBuySideLiq, dispBuySideLiquidity)
+ array.push(histSellSideLiq, dispSellSideLiquidity)
+ array.push(histSessionTime, time[1])
+ numToRemove = math.max(0, array.size(histBuySideLiq) - MAX_HIST_SESSIONS)
+ for _ = 0 to numToRemove - 1
+ if array.size(histBuySideLiq) > 0
+ array.shift(histBuySideLiq)
+ if array.size(histSellSideLiq) > 0
+ array.shift(histSellSideLiq)
+ if array.size(histSessionTime) > 0
+ array.shift(histSessionTime)
+ if array.size(histBuySideLabels) > 0
+ label.delete(array.shift(histBuySideLabels))
+ if array.size(histSellSideLabels) > 0
+ label.delete(array.shift(histSellSideLabels))
+ if array.size(histBuySideLines) > 0
+ line.delete(array.shift(histBuySideLines))
+ if array.size(histSellSideLines) > 0
+ line.delete(array.shift(histSellSideLines))
+//======================================================
+// RISK/REWARD STATE VARIABLES
+//======================================================
+var float entryPrice = na
+var float stopLoss = na
+var float takeProfit = na
+var float positionRisk = na
+var float positionReward = na
+//======================================================
+// RISK/REWARD FUNCTIONS
+//======================================================
+f_calculateRiskReward() =>
+ long_riskAmount = accountSize * (riskPercent / 100.0)
+ if not na(dispBuySideLiquidity) and not na(developingVAL)
+ long_entry = dispBuySideLiquidity
+ long_sl = developingVAL
+ long_distance = long_entry - long_sl
+ if long_distance > 0
+ long_tp = long_entry + (long_distance * rewardMultiplier)
+ [long_entry, long_sl, long_tp, long_riskAmount, long_distance * rewardMultiplier]
+ else
+ [na, na, na, na, na]
+ else
+ [na, na, na, na, na]
+f_calculateShortRiskReward() =>
+ short_riskAmount = accountSize * (riskPercent / 100.0)
+ if not na(dispSellSideLiquidity) and not na(developingVAH)
+ short_entry = dispSellSideLiquidity
+ short_sl = developingVAH
+ short_distance = short_sl - short_entry
+ if short_distance > 0
+ short_tp = short_entry - (short_distance * rewardMultiplier)
+ [short_entry, short_sl, short_tp, short_riskAmount, short_distance * rewardMultiplier]
+ else
+ [na, na, na, na, na]
+ else
+ [na, na, na, na, na]
+//======================================================
+// CONTROL BOX LOGIC [CACHED ARRAY.GET + TWMA INTEGRATION]
+//======================================================
+float anchorVal = na(dayOpenLevel) ? close : dayOpenLevel
+string[] levelNames = array.new_string()
+float[] levelVals = array.new_float()
+float[] levelWeights = array.new_float()
+array.push(levelNames, "POC [Day]")
+array.push(levelVals, na(stableDayPoc) ? close : stableDayPoc)
+array.push(levelWeights, wDayPoc)
+array.push(levelNames, "POC [Week]")
+array.push(levelVals, na(stableWeekPoc) ? close : stableWeekPoc)
+array.push(levelWeights, wWeekPoc)
+array.push(levelNames, "Session_FRVP")
+array.push(levelVals, na(latestSessionFrvpPoc) ? close : latestSessionFrvpPoc)
+array.push(levelWeights, wSessionFrvp)
+array.push(levelNames, "HTF POC")
+array.push(levelVals, na(heatPocPrice) ? close : heatPocPrice)
+array.push(levelWeights, wHtfPoc)
+array.push(levelNames, "P1")
+p1Val = na(lockedSessionVAH) or na(latestSessionFrvpPoc) ? close : latestSessionFrvpPoc + (lockedSessionVAH - latestSessionFrvpPoc)
+array.push(levelVals, p1Val)
+array.push(levelWeights, wP1)
+array.push(levelNames, "D1")
+d1Val = na(lockedSessionVAL) or na(latestSessionFrvpPoc) ? close : latestSessionFrvpPoc - (latestSessionFrvpPoc - lockedSessionVAL)
+array.push(levelVals, d1Val)
+array.push(levelWeights, wD1)
+array.push(levelNames, "Anchor")
+array.push(levelVals, anchorVal)
+array.push(levelWeights, wAnchor)
+array.push(levelNames, "TWMA Trend")
+twmaVal = twmaGreen ? w_fast : twmaYellow ? w_mid : w_slow
+array.push(levelVals, twmaVal)
+array.push(levelWeights, wTwmaTrend)
+float highWeightAbove = na
+for i = 0 to array.size(levelVals) - 1
+ wt = array.get(levelWeights, i)
+ vl = array.get(levelVals, i)
+ if wt >= 11 and vl > close
+ if na(highWeightAbove) or vl < highWeightAbove
+ highWeightAbove := vl
+float highWeightBelow = na
+for i = 0 to array.size(levelVals) - 1
+ wt = array.get(levelWeights, i)
+ vl = array.get(levelVals, i)
+ if wt >= 11 and vl < close
+ if na(highWeightBelow) or vl > highWeightBelow
+ highWeightBelow := vl
+string bias = ""
+string buyersControlStr = ""
+string sellersControlStr = ""
+bool cmpAboveAnchor = close > anchorVal
+bool cmpBelowAnchor = close < anchorVal
+if cmpAboveAnchor and not na(highWeightAbove)
+ bias := "BULLISH BIAS"
+ buyersControlStr := "Buyers in Control above " + str.tostring(anchorVal, format.mintick)
+ sellersControlStr := "No Sellers in Control"
+else if cmpBelowAnchor and not na(highWeightBelow)
+ bias := "BEARISH BIAS"
+ sellersControlStr := "Sellers in Control below " + str.tostring(anchorVal, format.mintick)
+ buyersControlStr := "No Buyers in Control"
+else if cmpAboveAnchor
+ bias := "BULLISH BIAS"
+ buyersControlStr := "Buyers in Control above " + str.tostring(anchorVal, format.mintick)
+ sellersControlStr := "No Sellers in Control"
+else if cmpBelowAnchor
+ bias := "BEARISH BIAS"
+ sellersControlStr := "Sellers in Control below " + str.tostring(anchorVal, format.mintick)
+ buyersControlStr := "No Buyers in Control"
+else
+ bias := "BALANCED BIAS"
+ buyersControlStr := "No Buyers in Control"
+ sellersControlStr := "No Sellers in Control"
+string twmaSignal = twmaGreen ? " [TWMA: STRONG BULLISH]" : twmaYellow ? " [TWMA: WEAK BULLISH]" : " [TWMA: BEARISH]"
+//======================================================
+// RISK/REWARD CALCULATION
+//======================================================
+if bias == "BULLISH BIAS" and confluenceActive
+ [entry, sl, tp, risk, reward] = f_calculateRiskReward()
+ entryPrice := entry
+ stopLoss := sl
+ takeProfit := tp
+ positionRisk := risk
+ positionReward := reward
+else if bias == "BEARISH BIAS" and confluenceActive
+ [entry, sl, tp, risk, reward] = f_calculateShortRiskReward()
+ entryPrice := entry
+ stopLoss := sl
+ takeProfit := tp
+ positionRisk := risk
+ positionReward := reward
+else
+ entryPrice := na
+ stopLoss := na
+ takeProfit := na
+ positionRisk := na
+ positionReward := na
+//======================================================
+// ALERTS [EXTENDED WITH TWMA]
+//======================================================
+if enableAlerts and barstate.isconfirmed
+ if alertCrossLiq
+ if ta.crossover(close, dispBuySideLiquidity)
+ alert("Price crossed ABOVE Buyside Liquidity", alert.freq_once_per_bar)
+ if ta.crossunder(close, dispSellSideLiquidity)
+ alert("Price crossed BELOW Sellside Liquidity", alert.freq_once_per_bar)
+ if alertDailyWeeklyConf and dailyWeeklyConfluence and not confluenceActive[1]
+ alert("Daily-Weekly POC Confluence ACTIVE", alert.freq_once_per_bar)
+ if alertLVNEnter and not na(lvnVAH) and not na(lvnVAL)
+ if close >= lvnVAL and close <= lvnVAH and (close[1] < lvnVAL or close[1] > lvnVAH)
+ alert("Price entered LVN VAH/VAL band", alert.freq_once_per_bar)
+ if alertBiasFlip and bias != prevBias and prevBias != ""
+ alert("Bias Flip: " + prevBias + " → " + bias, alert.freq_once_per_bar)
+ if alertTwmaConfluence and twmaConfluence and not twmaConfluence[1]
+ alert("TWMA Trend Confluence ACTIVE: " + twmaTrendDirection, alert.freq_once_per_bar)
+prevBias := bias
+//======================================================
+// BAR COLORING: LIQUIDITY RANGE
+//======================================================
+color barColor = na
+if showBarColor
+ if not na(dispSellSideLiquidity) and close > dispSellSideLiquidity
+ barColor := color.green
+ else if not na(dispBuySideLiquidity) and close < dispBuySideLiquidity
+ barColor := color.red
+ else if not na(dispBuySideLiquidity) and not na(dispSellSideLiquidity)
+ barColor := color.black
+barcolor(barColor)
+//======================================================
+// MERGED CONTROL BOX + RISK/REWARD TABLE [BOTTOM-CENTER]
+// 3 rows × 3 columns: bias/TWMA/confluence (row0), buyers/entry (row1), sellers/sl+tp (row2)
+//======================================================
+var table mergedControlTable = table.new(position.bottom_center, 3, 3, border_width = 1, frame_width = 1, frame_color = color.white)
+if barstate.islast
+ // ROW 0: BIAS | TWMA | CONFLUENCE
+ biasColor = bias == "BULLISH BIAS" ? color.new(color.green, 25) : bias == "BEARISH BIAS" ? color.new(color.red, 25) : color.new(color.gray, 80)
+ table.cell(mergedControlTable, 0, 0, text = bias, bgcolor = biasColor, text_color = color.black, text_size = size.large, text_halign = text.align_center)
+ table.cell(mergedControlTable, 1, 0, text = twmaSignal, bgcolor = color.new(color.blue, 40), text_color = color.white, text_size = size.normal, text_halign = text.align_center)
+ confluenceStatus = confluenceActive ? "✓ CONFLUENCE" : "WAIT ⚠️"
+ confluenceColor = confluenceActive ? color.new(color.green, 60) : color.new(color.gray, 80)
+ table.cell(mergedControlTable, 2, 0, text = confluenceStatus, bgcolor = confluenceColor, text_color = color.black, text_size = size.normal, text_halign = text.align_center)
+ // ROW 1: BUYERS CONTROL (merged 0-1) | ENTRY (col 2)
+ table.cell(mergedControlTable, 0, 1, text = buyersControlStr + " →", bgcolor = color.new(color.green, 10), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ table.merge_cells(mergedControlTable, 0, 1, 1, 1)
+ entryStr = na(entryPrice) ? "—" : str.tostring(entryPrice, format.mintick)
+ table.cell(mergedControlTable, 2, 1, text = "Entry: " + entryStr, bgcolor = color.new(color.blue, 60), text_color = color.white, text_size = size.small, text_halign = text.align_center)
+ // ROW 2: SELLERS CONTROL (merged 0-1) | SL+TP (col 2)
+ table.cell(mergedControlTable, 0, 2, text = sellersControlStr + " →", bgcolor = color.new(color.red, 10), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ table.merge_cells(mergedControlTable, 0, 2, 1, 2)
+ slStr = na(stopLoss) ? "—" : str.tostring(stopLoss, format.mintick)
+ tpStr = na(takeProfit) ? "—" : str.tostring(takeProfit, format.mintick)
+ table.cell(mergedControlTable, 2, 2, text = "SL: " + slStr + " | TP: " + tpStr, bgcolor = color.new(color.orange, 50), text_color = color.white, text_size = size.small, text_halign = text.align_center)
+//======================================================
+// PLOT PRIMARY POCs (TOP LEVEL)
+//======================================================
+plot(na(stableDayPoc) ? na : stableDayPoc, title="POC(Day)", color=pocDayColor, linewidth=pocDayWidth)
+plot(na(stableWeekPoc) ? na : stableWeekPoc, title="POC(Week)", color=pocWeekColor, linewidth=pocWeekWidth)
+//======================================================
+// PLOT TWMA TREND LINES (INTEGRATED)
+//======================================================
+plot(w_mid, color=c2, linewidth=3, title="WMA 1369")
+plot(w_slow, color=c3, linewidth=4, title="WMA 1440")
+//======================================================
+// PLOT LIQUIDITY LEVELS (TOP LEVEL) [FIXED]
+//======================================================
+plot(showLiquidityLevels and not na(dispBuySideLiquidity) ? dispBuySideLiquidity : na, title="Buyside Liquidity", color=buyLiqColor, linewidth=liqLineWidth, style=plot.style_linebr)
+plot(showLiquidityLevels and not na(dispSellSideLiquidity) ? dispSellSideLiquidity : na, title="Sellside Liquidity", color=sellLiqColor, linewidth=liqLineWidth, style=plot.style_linebr)
+//======================================================
+// LIQUIDITY LABELS ON CHART [NEW]
+//======================================================
+if showLiquidityLevels and barstate.islast
+ if not na(dispBuySideLiquidity)
+ label.new(x = bar_index, y = dispBuySideLiquidity, text = "BuyLiQ", xloc = xloc.bar_index, yloc = yloc.price, color = color.black, textcolor = color.white, style = label.style_label_left, size = size.normal)
+ if not na(dispSellSideLiquidity)
+ label.new(x = bar_index, y = dispSellSideLiquidity, text = "SellLiQ", xloc = xloc.bar_index, yloc = yloc.price, color = color.black, textcolor = color.white, style = label.style_label_left, size = size.normal)
+//======================================================
+// LIQUIDITY TABLE (TOP LEVEL)
+//======================================================
+tPos = liqTablePos == "top_left" ? position.top_left : liqTablePos == "top_center" ? position.top_center : liqTablePos == "top_right" ? position.top_right : liqTablePos == "middle_left" ? position.middle_left : liqTablePos == "middle_center" ? position.middle_center : liqTablePos == "middle_right" ? position.middle_right : liqTablePos == "bottom_left" ? position.bottom_left : liqTablePos == "bottom_center" ? position.bottom_center : position.bottom_right
+tSize = liqTableSize == "small" ? size.small : liqTableSize == "normal" ? size.normal : size.large
+var table liqTable = table.new(tPos, 2, 3, border_width = 1, frame_width = 1, frame_color = color.white)
+if showLiqTable and barstate.islast
+ table.cell(liqTable, 0, 0, text = "Liquidity Level", bgcolor = color.new(color.gray, 80), text_color = color.white, text_size = tSize, text_halign = text.align_center)
+ table.cell(liqTable, 1, 0, text = "Price (Distance)", bgcolor = color.new(color.gray, 80), text_color = color.white, text_size = tSize, text_halign = text.align_center)
+ buyPrice = na(dispBuySideLiquidity) ? close : dispBuySideLiquidity
+ buyDist = close - buyPrice
+ table.cell(liqTable, 0, 1, text = "Buyside", bgcolor = color.new(color.green, 90), text_color = color.white, text_size = tSize, text_halign = text.align_left)
+ table.cell(liqTable, 1, 1, text = str.tostring(buyPrice, format.mintick) + " (" + str.tostring(buyDist, format.mintick) + ")", bgcolor = color.new(color.green, 95), text_color = color.white, text_size = tSize, text_halign = text.align_right)
+ sellPrice = na(dispSellSideLiquidity) ? close : dispSellSideLiquidity
+ sellDist = sellPrice - close
+ table.cell(liqTable, 0, 2, text = "Sellside", bgcolor = color.new(color.red, 90), text_color = color.white, text_size = tSize, text_halign = text.align_left)
+ table.cell(liqTable, 1, 2, text = str.tostring(sellPrice, format.mintick) + " (" + str.tostring(sellDist, format.mintick) + ")", bgcolor = color.new(color.red, 95), text_color = color.white, text_size = tSize, text_halign = text.align_right)
+//======================================================
+// KEY LEVELS TABLE [CLEAN DISPLAY]
+//======================================================
+kPos = keyLevelsPos == "top_left" ? position.top_left : keyLevelsPos == "top_center" ? position.top_center : keyLevelsPos == "top_right" ? position.top_right : keyLevelsPos == "middle_left" ? position.middle_left : keyLevelsPos == "middle_center" ? position.middle_center : keyLevelsPos == "middle_right" ? position.middle_right : keyLevelsPos == "bottom_left" ? position.bottom_left : keyLevelsPos == "bottom_center" ? position.bottom_center : position.bottom_right
+kSize = keyLevelsSize == "small" ? size.small : keyLevelsSize == "normal" ? size.normal : size.large
+var table keyLevelsTable = table.new(kPos, 2, 8, border_width = 1, frame_width = 1, frame_color = color.white)
+if showKeyLevelsTable and barstate.islast
+ pocDayVal = na(stableDayPoc) ? close : stableDayPoc
+ pocWeekVal = na(stableWeekPoc) ? close : stableWeekPoc
+ htfPocVal = na(heatPocPrice) ? close : heatPocPrice
+ cmpVal = close
+ buyLiqVal = na(dispBuySideLiquidity) ? close : dispBuySideLiquidity
+ sellLiqVal = na(dispSellSideLiquidity) ? close : dispSellSideLiquidity
+ anchorVal2 = anchorVal
+ table.clear(keyLevelsTable, 0, 0, 1, 7)
+ table.cell(keyLevelsTable, 0, 0, text = "POC [Day]", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ table.cell(keyLevelsTable, 1, 0, text = str.tostring(pocDayVal, format.mintick), bgcolor = color.new(color.black, 25), text_color = color.white, text_size = size.large, text_halign = text.align_right)
+ table.cell(keyLevelsTable, 0, 1, text = "Anchor", bgcolor = color.new(color.black, 15), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ table.cell(keyLevelsTable, 1, 1, text = str.tostring(anchorVal2, format.mintick), bgcolor = color.new(color.black, 25), text_color = color.white, text_size = size.large, text_halign = text.align_right)
+ table.cell(keyLevelsTable, 0, 2, text = "POC [Week]", bgcolor = color.new(color.green, 25), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ table.cell(keyLevelsTable, 1, 2, text = str.tostring(pocWeekVal, format.mintick), bgcolor = color.new(color.green, 0), text_color = color.white, text_size = size.large, text_halign = text.align_right)
+ table.cell(keyLevelsTable, 0, 3, text = "HTF POC", bgcolor = color.new(color.green, 25), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ table.cell(keyLevelsTable, 1, 3, text = str.tostring(htfPocVal, format.mintick), bgcolor = color.new(color.green, 0), text_color = color.white, text_size = size.large, text_halign = text.align_right)
+ table.cell(keyLevelsTable, 0, 4, text = "Session_FRVP", bgcolor = color.new(color.blue, 25), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ sessionVal = na(latestSessionFrvpPoc) ? close : latestSessionFrvpPoc
+ table.cell(keyLevelsTable, 1, 4, text = str.tostring(sessionVal, format.mintick), bgcolor = color.new(color.blue, 0), text_color = color.white, text_size = size.large, text_halign = text.align_right)
+ table.cell(keyLevelsTable, 0, 5, text = "CMP", bgcolor = color.new(color.yellow, 25), text_color = color.black, text_size = size.large, text_halign = text.align_left)
+ table.cell(keyLevelsTable, 1, 5, text = str.tostring(cmpVal, format.mintick), bgcolor = color.new(color.yellow, 0), text_color = color.black, text_size = size.large, text_halign = text.align_right)
+ table.cell(keyLevelsTable, 0, 6, text = "SellLiQ", bgcolor = color.new(color.red, 10), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ table.cell(keyLevelsTable, 1, 6, text = str.tostring(sellLiqVal, format.mintick), bgcolor = color.new(color.red, 0), text_color = color.white, text_size = size.large, text_halign = text.align_right)
+ table.cell(keyLevelsTable, 0, 7, text = "BuyLiQ", bgcolor = color.new(color.green, 10), text_color = color.white, text_size = size.large, text_halign = text.align_left)
+ table.cell(keyLevelsTable, 1, 7, text = str.tostring(buyLiqVal, format.mintick), bgcolor = color.new(color.green, 0), text_color = color.white, text_size = size.large, text_halign = text.align_right)
+//======================================================
+// DRAW FRVP SESSIONS
+//======================================================
+if barstate.islast
+ if array.size(pocLines) > 0
+ for i = 0 to array.size(pocLines) - 1
+ line.delete(array.get(pocLines, i))
+ array.clear(pocLines)
+ if array.size(lvnLines) > 0
+ for i = 0 to array.size(lvnLines) - 1
+ line.delete(array.get(lvnLines, i))
+ array.clear(lvnLines)
+ if array.size(allLabels) > 0
+ for i = 0 to array.size(allLabels) - 1
+ label.delete(array.get(allLabels, i))
+ array.clear(allLabels)
+ sessionCount = math.min(array.size(sessionEnds), effective_profiles)
+ if sessionCount > 0
+ for s = 0 to sessionCount - 1
+ startBar = array.get(sessionStarts, s)
+ endBar = array.get(sessionEnds, s)
+ if endBar > startBar
+ [poc, vah, val] = f_getCachedProfile(startBar, endBar, effective_rows)
+ if not na(poc)
+ startBack = bar_index - startBar
+ endBack = bar_index - endBar
+ if startBack >= 0 and startBack < 5000 and endBack >= 0 and endBack < 5000
+ t1 = time[endBack]
+ sessionBars = endBar - startBar
+ extendBack = math.max(endBack - sessionBars, 0)
+ extendBack := math.min(extendBack, 4999)
+ t2 = extendIntoNext ? time[extendBack] : t1
+ pocLine = line.new(x1 = t1, y1 = poc, x2 = t2, y2 = poc, xloc = xloc.bar_time, color = pocSessionColor, width = pocSessionWidth)
+ array.push(pocLines, pocLine)
+ if s == sessionCount - 1
+ latestSessionFrvpPoc := poc
+ if showLVN and not na(lvnVAH) and not na(lvnVAL) and not na(lvnSessionStart)
+ if na(lvnSessionEnd) or bar_index <= lvnSessionEnd + 100
+ sessionStartBack = bar_index - lvnSessionStart
+ sessionEndBack = na(lvnSessionEnd) ? 0 : bar_index - lvnSessionEnd
+ sessionStartBack := math.max(sessionStartBack, 0)
+ sessionStartBack := math.min(sessionStartBack, 4999)
+ sessionEndBack := math.max(sessionEndBack, 0)
+ sessionEndBack := math.min(sessionEndBack, 4999)
+ if sessionStartBack >= 0 and sessionEndBack >= 0
+ t_start = time[sessionStartBack]
+ t_end = time[sessionEndBack]
+ lvnVAHLine = line.new(x1 = t_start, y1 = lvnVAH, x2 = t_end, y2 = lvnVAH, xloc = xloc.bar_time, color = lvnVAHColor, width = lvnWidth, style = line.style_solid)
+ array.push(lvnLines, lvnVAHLine)
+ lvnVALLine = line.new(x1 = t_start, y1 = lvnVAL, x2 = t_end, y2 = lvnVAL, xloc = xloc.bar_time, color = lvnVALColor, width = lvnWidth, style = line.style_solid)
+ array.push(lvnLines, lvnVALLine)
+//======================================================
+// LIQUIDITY HEATMAP: VISUALIZATION
+//======================================================
+var box[] heatBoxes = array.new<box>()
+if barstate.islast and showHeatmap and heatIsNewPeriod
+ for bx in heatBoxes
+ box.delete(bx)
+ heatBoxes.clear()
+ for idx = 0 to heatBucketCount - 1
+ float vol = array.get(heatVolArray, idx)
+ float p = array.get(heatBucketPrices, idx)
+ float ratio = heatMaxVol > 0 ? vol / heatMaxVol : 0.0
+ int boxWidth = math.max(1, math.round(ratio * heatWidth))
+ color heatColor = ratio > 0.75 ? color.new(HEAT_HIGH, 100 - heatOpacity) : ratio > 0.45 ? color.new(HEAT_MID, 100 - heatOpacity) : color.new(HEAT_LOW, 100 - heatOpacity)
+ box hb = box.new(left = bar_index + heatWidth - boxWidth, top = p + heatRowSize / 2, right = bar_index + heatWidth, bottom = p - heatRowSize / 2, bgcolor = heatColor, border_color = na)
+ heatBoxes.push(hb)
+//======================================================
+// LIQUIDITY HEATMAP: DEVELOPING POC LINE
+//======================================================
+var chart.point[] heatPocPoints = array.new<chart.point>()
+if heatIsNewPeriod
+ heatPocPoints.clear()
+if not na(heatPocPrice)
+ heatPocPoints.push(chart.point.from_index(bar_index, heatPocPrice))
+var polyline heatPocLine = na
+if barstate.islast and showHeatPOC
+ polyline.delete(heatPocLine)
+ if heatPocPoints.size() > 1
+ heatPocLine := polyline.new(heatPocPoints, xloc = xloc.bar_index, line_color = heatPocColor, line_width = heatPocWidth)
+//======================================================
+// EXTENDED POC
+//======================================================
+var line heatPocProjection = line.new(na, na, na, na, xloc = xloc.bar_index, style = line.style_dashed)
+if barstate.islast and showHeatPOC and extendHeatPOC and not na(heatPocPrice)
+ line.set_xy1(heatPocProjection, bar_index, heatPocPrice)
+ line.set_xy2(heatPocProjection, bar_index + heatWidth + 10, heatPocPrice)
+ line.set_color(heatPocProjection, heatPocColor)
+ line.set_width(heatPocProjection, heatPocWidth)

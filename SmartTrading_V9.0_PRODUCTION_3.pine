@@ -1,0 +1,395 @@
+// @version=6
+indicator("Smart Trading Suite V9.0 PRODUCTION", overlay=false, max_lines_count=100, max_boxes_count=50, max_labels_count=500, max_bars_back=5000)
+
+// STATE CONSTANTS
+STATE_STRONG_BUY = "STRONG BUY"
+STATE_ACCUMULATION = "ACCUMULATION"
+STATE_SIDEWAYS = "SIDEWAYS"
+STATE_DISTRIBUTION = "DISTRIBUTION"
+STATE_STRONG_SELL = "STRONG SELL"
+
+// MTF DOM SIGNALS
+SIGNAL_STRONG_BULL = 1.0
+SIGNAL_BULL = 0.5
+SIGNAL_NEUTRAL = 0.0
+SIGNAL_BEAR = -0.5
+SIGNAL_STRONG_BEAR = -1.0
+
+// DELTA LINE COLOR STATES
+DELTA_GREEN = 1.0
+DELTA_BLACK = 0.0
+DELTA_RED = -1.0
+
+// THRESHOLDS
+SESSION_DELTA_MAX = 10000.0
+BEARISH_DIV_LEVEL = 2500.0
+DELTA_SPIKE_BAND = 5000.0
+ATR_WINDOW = 20
+MIN_DOM_VOLUME_RATIO = 0.3
+UPPER_ZONE_RATIO = 0.25
+LOWER_ZONE_RATIO = 0.25
+MIN_VAL_VAH_CONCENTRATION = 0.65
+
+// SESSION CONFIG
+string sessionTZ = input.string("Asia/Kolkata", "Session TZ", group="Session")
+int sessHour = input.int(3, "Session Start Hour", minval=0, maxval=23, group="Session")
+int sessMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group="Session")
+
+// MTF CONFIG
+int mtfLookback = input.int(20, "MTF Lookback", minval=5, maxval=100, group="MTF_DOM")
+
+// DISPLAY CONFIG
+bool showState = input.bool(true, "Show Trend State", group="Display")
+bool showSignals = input.bool(true, "Show Signal Alerts", group="Display")
+
+// STATE VARIABLES
+var float sessionDelta = 0.0
+var float sessionHigh = na
+var float sessionLow = na
+var int barsInSession = 0
+var float lockedSessionVAL = na
+var float lockedSessionVAH = na
+var bool sessionLocked = false
+var bool bearishDivFlag = false
+var bool deltaSpikeFlagUp = false
+var bool deltaSpikeFlagDn = false
+var string prevState = STATE_SIDEWAYS
+
+var float mtfDomSignal = SIGNAL_NEUTRAL
+var float mtfConfidence = 0.0
+
+var string trendState = STATE_SIDEWAYS
+var color trendColor = color.gray
+var float deltaLineColor = DELTA_BLACK
+
+var table stateBox = na
+var array<string> stateHistory = array.new<string>()
+
+// UTILITY FUNCTIONS
+f_clamp(float val, float minVal, float maxVal) =>
+    math.max(minVal, math.min(maxVal, val))
+
+f_is_valid(float x) =>
+    not na(x)
+
+f_session_phase() =>
+    curHour = hour(time, sessionTZ)
+    curMin = minute(time, sessionTZ)
+    if na(curHour) or na(curMin)
+        -1
+    else
+        hrsElapsed = (curHour - sessHour + 24) % 24
+        if curMin < sessMinute and hrsElapsed > 0
+            hrsElapsed - 1
+        else
+            hrsElapsed
+
+f_is_new_session() =>
+    h = hour(time, sessionTZ)
+    m = minute(time, sessionTZ)
+    not na(h) and not na(m) and h == sessHour and m == sessMinute
+
+// SESSION DELTA ACCUMULATION
+
+
+// VAL/VAH LOCK & CONCENTRATION (READ-ONLY, no mutations)
+f_val_vah_lock() =>
+    if sessionLocked and f_is_valid(lockedSessionVAL) and f_is_valid(lockedSessionVAH)
+        [lockedSessionVAL, lockedSessionVAH, true]
+    else if barsInSession > 100
+        range_ = sessionHigh - sessionLow
+        val = sessionLow + range_ * (1.0 - LOWER_ZONE_RATIO)
+        vah = sessionHigh - range_ * (1.0 - UPPER_ZONE_RATIO)
+        vahMinusVal = vah - val
+        concentration = vahMinusVal != 0.0 ? math.abs((close - val) / vahMinusVal) : 0.0
+        if concentration > MIN_VAL_VAH_CONCENTRATION
+            [val, vah, true]
+        else
+            [val, vah, false]
+    else
+        range_ = sessionHigh - sessionLow
+        val = sessionLow + range_ * LOWER_ZONE_RATIO
+        vah = sessionHigh - range_ * UPPER_ZONE_RATIO
+        [val, vah, false]
+
+// BEARISH DIVERGENCE DETECTION
+f_bearish_divergence_detect() =>
+    if barsInSession < 3
+        false
+    else
+        priceNewHigh = high > sessionHigh[1]
+        deltaBelowDiv = sessionDelta < -BEARISH_DIV_LEVEL
+        closeBelowSessionHi = close < sessionHigh
+        priceNewHigh and deltaBelowDiv and closeBelowSessionHi
+
+// DELTA SPIKE DETECTION
+f_delta_spike_detect() =>
+    atr = ta.atr(ATR_WINDOW)
+    volSma = ta.sma(volume, 20)
+    if volSma <= 0 or atr <= 0
+        [false, false]
+    else
+        volRatio = volSma != 0.0 ? volume / volSma : 1.0
+        spikeThreshold = atr * volRatio * DELTA_SPIKE_BAND / 1000.0
+        absDelta = math.abs(sessionDelta)
+        isSpike = absDelta > spikeThreshold
+        spikeUp = isSpike and sessionDelta > 0
+        spikeDn = isSpike and sessionDelta < 0
+        [spikeUp, spikeDn]
+
+// DETERMINE DELTA LINE COLOR STATE
+f_delta_line_color() =>
+    if sessionDelta > 0
+        DELTA_GREEN
+    else if sessionDelta < 0
+        DELTA_RED
+    else
+        DELTA_BLACK
+
+// MTF DOMINANCE (SINGLE TIMEFRAME)
+f_mtf_dom_single_tf(int lookback) =>
+    guardedLb = math.min(math.max(lookback, 5), bar_index)
+    if guardedLb <= 0
+        [SIGNAL_NEUTRAL, 0.0]
+    else
+        hi = ta.highest(high, guardedLb)
+        lo = ta.lowest(low, guardedLb)
+        if not f_is_valid(hi) or not f_is_valid(lo) or lo >= hi
+            [SIGNAL_NEUTRAL, 0.0]
+        else
+            range_ = math.max(hi - lo, syminfo.mintick)
+            upperBound = hi - (range_ * UPPER_ZONE_RATIO)
+            lowerBound = lo + (range_ * LOWER_ZONE_RATIO)
+            totalVol = 0.0
+            hiVol = 0.0
+            loVol = 0.0
+            maxI = math.min(guardedLb, 500)
+            for i = 0 to maxI - 1
+                barVol = math.max(volume[i], 0.0)
+                totalVol += barVol
+                if high[i] >= upperBound
+                    hiVol += barVol
+                if low[i] <= lowerBound
+                    loVol += barVol
+            if totalVol <= 0.0
+                [SIGNAL_NEUTRAL, 0.5]
+            else
+                hiRatio = totalVol != 0.0 ? hiVol / totalVol : 0.0
+                loRatio = totalVol != 0.0 ? loVol / totalVol : 0.0
+                if hiRatio > MIN_DOM_VOLUME_RATIO and hiRatio > loRatio
+                    [SIGNAL_STRONG_BULL, hiRatio]
+                else if loRatio > MIN_DOM_VOLUME_RATIO and loRatio > hiRatio
+                    [SIGNAL_STRONG_BEAR, loRatio]
+                else
+                    [SIGNAL_NEUTRAL, 0.5]
+
+// MTF CONFLUENCE (3x TF: 1m, 5m, 15m)
+f_mtf_dom_confluence(int lb1m, int lb5m, int lb15m) =>
+    safeLb1m = math.min(math.max(lb1m, 5), bar_index)
+    safeLb5m = math.min(math.max(lb5m, 5), bar_index)
+    safeLb15m = math.min(math.max(lb15m, 5), bar_index)
+    
+    [s1, c1] = f_mtf_dom_single_tf(safeLb1m)
+    [s5, c5] = f_mtf_dom_single_tf(safeLb5m)
+    [s15, c15] = f_mtf_dom_single_tf(safeLb15m)
+    
+    bullCount = (s1 > 0.2 ? 1 : 0) + (s5 > 0.2 ? 1 : 0) + (s15 > 0.2 ? 1 : 0)
+    bearCount = (s1 < -0.2 ? 1 : 0) + (s5 < -0.2 ? 1 : 0) + (s15 < -0.2 ? 1 : 0)
+    avgConfidence = (c1 + c5 + c15) / 3.0
+    
+    if bullCount >= 2
+        [SIGNAL_STRONG_BULL, avgConfidence]
+    else if bearCount >= 2
+        [SIGNAL_STRONG_BEAR, avgConfidence]
+    else if bullCount == 1
+        [SIGNAL_BULL, avgConfidence * 0.7]
+    else if bearCount == 1
+        [SIGNAL_BEAR, avgConfidence * 0.7]
+    else
+        [SIGNAL_NEUTRAL, avgConfidence * 0.5]
+
+// STATE MACHINE: BAR COLOR + MTF + DELTA → TREND STATE (NO EXCEPTIONS)
+f_determine_trend_state(float barColorRaw, float mtfSignal, float deltaColor) =>
+    // Guard all inputs
+    barColor = f_clamp(barColorRaw, -1.0, 1.0)
+    mtfSig = f_clamp(mtfSignal, -1.0, 1.0)
+    delta = f_clamp(deltaColor, -1.0, 1.0)
+    
+    // Classification thresholds
+    isGreenBar = barColor > 0.5
+    isBlackBar = math.abs(barColor) < 0.1
+    isRedBar = barColor < -0.5
+    
+    isMtfBull = mtfSig > 0.2
+    isMtfBear = mtfSig < -0.2
+    isMtfNeutral = math.abs(mtfSig) <= 0.2
+    
+    isDeltaGreen = delta > 0.5
+    isDeltaRed = delta < -0.5
+    isDeltaBlack = math.abs(delta) < 0.1
+    
+    // STATE MACHINE LOGIC (deterministic, zero exceptions)
+    if isBlackBar
+        // BLACK BAR → SIDEWAYS (always)
+        [STATE_SIDEWAYS, color.new(color.gray, 50), 0.0]
+    else if isGreenBar and (isMtfBull or isMtfNeutral) and (isDeltaGreen or isDeltaBlack)
+        // GREEN + (MTF_BULL|NEUTRAL) + (DELTA_GREEN|BLACK)
+        if isDeltaGreen and isMtfBull
+            // Best case: GREEN + MTF_BULL + DELTA_GREEN
+            [STATE_STRONG_BUY, color.new(color.green, 0), 1.0]
+        else if isDeltaGreen or isMtfBull
+            // Good case: GREEN + (MTF_BULL XOR DELTA_GREEN)
+            [STATE_ACCUMULATION, color.new(color.lime, 30), 0.6]
+        else
+            // Weak case: GREEN + NEUTRAL + DELTA_BLACK
+            [STATE_ACCUMULATION, color.new(color.lime, 50), 0.4]
+    else if isRedBar and (isMtfBear or isMtfNeutral) and (isDeltaRed or isDeltaBlack)
+        // RED + (MTF_BEAR|NEUTRAL) + (DELTA_RED|BLACK)
+        if isDeltaRed and isMtfBear
+            // Best case: RED + MTF_BEAR + DELTA_RED
+            [STATE_STRONG_SELL, color.new(color.red, 0), -1.0]
+        else if isDeltaRed or isMtfBear
+            // Good case: RED + (MTF_BEAR XOR DELTA_RED)
+            [STATE_DISTRIBUTION, color.new(color.maroon, 30), -0.6]
+        else
+            // Weak case: RED + NEUTRAL + DELTA_BLACK
+            [STATE_DISTRIBUTION, color.new(color.maroon, 50), -0.4]
+    else
+        // DEFAULT CATCH-ALL → SIDEWAYS (no exceptions)
+        [STATE_SIDEWAYS, color.new(color.gray, 50), 0.0]
+
+// BAR COLOR DETERMINATION (close vs open) → {-1.0, 0.0, 1.0}
+f_bar_color_state() =>
+    if close > open
+        1.0  // GREEN
+    else if close < open
+        -1.0  // RED
+    else
+        0.0  // BLACK (doji/equal/neutral)
+
+// ============ MAIN CALCULATION LOOP ============
+// SESSION DELTA ACCUMULATION & STATE RESET
+isNewSession = f_is_new_session()
+isUp = close > open
+isDown = close < open
+buyVol = isUp ? math.max(volume, 0.0) : 0.0
+sellVol = isDown ? math.max(volume, 0.0) : 0.0
+barDelta = buyVol - sellVol
+
+if isNewSession
+    // INLINE SESSION RESET (no function call)
+    sessionDelta := 0.0
+    sessionHigh := high
+    sessionLow := low
+    barsInSession := 1
+    sessionLocked := false
+    lockedSessionVAL := na
+    lockedSessionVAH := na
+    bearishDivFlag := false
+    deltaSpikeFlagUp := false
+    deltaSpikeFlagDn := false
+    sessionDelta := barDelta
+else
+    newDelta = sessionDelta + barDelta
+    clampedDelta = f_clamp(newDelta, -SESSION_DELTA_MAX, SESSION_DELTA_MAX)
+    newHigh = math.max(sessionHigh, high)
+    newLow = math.min(sessionLow, low)
+    newBars = barsInSession + 1
+    sessionDelta := clampedDelta
+    sessionHigh := newHigh
+    sessionLow := newLow
+    barsInSession := newBars
+
+// DELTA LINE COLOR STATE
+deltaLineColor := f_delta_line_color()
+
+// VAL/VAH LOCK & CONCENTRATION CHECK (inline mutations)
+[val, vah, shouldLock] = f_val_vah_lock()
+if shouldLock
+    sessionLocked := true
+    lockedSessionVAL := val
+    lockedSessionVAH := vah
+
+// SIGNAL DETECTION (optional alerts)
+if showSignals
+    bearishDivFlag := f_bearish_divergence_detect()
+    [deltaSpikeFlagUp, deltaSpikeFlagDn] = f_delta_spike_detect()
+
+// MTF CONFLUENCE (3x TF)
+mtfLb = math.min(mtfLookback, bar_index)
+[tMtfSignal, tMtfConfidence] = f_mtf_dom_confluence(mtfLb, mtfLb * 5, mtfLb * 15)
+mtfDomSignal := tMtfSignal
+mtfConfidence := tMtfConfidence
+
+// STATE MACHINE EXECUTION
+barColorState = f_bar_color_state()
+[newState, newColor, stateStrength] = f_determine_trend_state(barColorState, mtfDomSignal, deltaLineColor)
+
+prevState := trendState
+trendState := newState
+trendColor := newColor
+
+// STATE TRANSITION TRACKING
+stateChanged = (prevState != trendState)
+if array.size(stateHistory) >= 100
+    array.shift(stateHistory)
+if stateChanged
+    array.push(stateHistory, trendState)
+
+// ============ DISPLAY & ALERTS ============
+if barstate.islast
+    if na(stateBox)
+        stateBox := table.new(position.bottom_left, 1, 4, border_width=2, border_color=color.gray)
+    else
+        table.clear(stateBox, 0, 0, 0, 3)
+    
+    if showState
+        // Main state display
+        table.cell(stateBox, 0, 0, trendState, bgcolor=trendColor, text_color=color.white, text_size=size.huge, text_halign=text.align_center)
+        
+        // Component status row
+        mtfStr = switch mtfDomSignal
+            SIGNAL_STRONG_BULL => "MTF: STRONG BULL ▲"
+            SIGNAL_BULL => "MTF: BULL ▲"
+            SIGNAL_NEUTRAL => "MTF: NEUTRAL ═"
+            SIGNAL_BEAR => "MTF: BEAR ▼"
+            SIGNAL_STRONG_BEAR => "MTF: STRONG BEAR ▼▼"
+            => "MTF: UNKNOWN"
+        
+        deltaStr = switch deltaLineColor
+            DELTA_GREEN => "DELTA: GREEN ↑"
+            DELTA_BLACK => "DELTA: BLACK ─"
+            DELTA_RED => "DELTA: RED ↓"
+            => "DELTA: UNKNOWN"
+        
+        barStr = switch barColorState
+            1.0 => "BAR: GREEN"
+            -1.0 => "BAR: RED"
+            => "BAR: BLACK"
+        
+        componentStr = barStr + " | " + mtfStr + " | " + deltaStr
+        table.cell(stateBox, 0, 1, componentStr, bgcolor=color.new(color.navy, 70), text_color=color.white, text_size=size.small)
+        
+        // Metrics row
+        deltaVal = str.tostring(sessionDelta, "0")
+        sessBar = str.tostring(barsInSession, "0")
+        metricsStr = "Δ=" + deltaVal + " | Bars=" + sessBar + " | Conf=" + str.tostring(mtfConfidence * 100, "0") + "%"
+        table.cell(stateBox, 0, 2, metricsStr, bgcolor=color.new(color.navy, 80), text_color=color.silver, text_size=size.tiny)
+        
+        // Signal alerts (if enabled)
+        if showSignals
+            alertStr = ""
+            if bearishDivFlag
+                alertStr += "⚠ BEARISH DIV "
+            if deltaSpikeFlagUp
+                alertStr += "🔼 DELTA SPIKE UP"
+            if deltaSpikeFlagDn
+                alertStr += "🔽 DELTA SPIKE DN"
+            if stateChanged
+                alertStr += "◆ STATE CHANGE"
+            
+            if alertStr != ""
+                table.cell(stateBox, 0, 3, alertStr, bgcolor=color.new(color.orange, 50), text_color=color.white, text_size=size.tiny)
+
+// ============ REFERENCE LINES ============
+hline(0, "Neutral", color=color.new(color.gray, 60), linestyle=hline.style_dotted)

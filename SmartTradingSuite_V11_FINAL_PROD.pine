@@ -1,0 +1,224 @@
+// @version=6
+indicator("Smart Trading Suite V11.0 FINAL RELEASE", overlay=true, max_labels_count=500, max_bars_back=5000)
+
+STATE_STRONG_BUY = "STRONG BUY 🚀🚀🚀"
+STATE_ACCUMULATION = "LONG ACCUMULATION 📈"
+STATE_SIDEWAYS = "SIDEWAYS [⚠ WAIT]"
+STATE_DISTRIBUTION = "SHORT ACCUMULATION 📉"
+STATE_STRONG_SELL = "STRONG SELL 🚨🚨🚨"
+
+SIGNAL_STRONG_BULL = 1.0
+SIGNAL_LONG_ACCUMULATION = 0.5
+SIGNAL_SIDEWAYS = 0.0
+SIGNAL_SHORT_ACCUMULATION = -0.5
+SIGNAL_STRONG_BEAR = -1.0
+
+DELTA_GREEN = 1.0
+DELTA_BLACK = 0.0
+DELTA_RED = -1.0
+
+SESSION_DELTA_MAX = 10000.0
+MIN_DOM_VOLUME_RATIO = 0.30
+UPPER_ZONE_RATIO = 0.25
+LOWER_ZONE_RATIO = 0.25
+VALUE_AREA_RATIO = 0.30
+DOM_DOMINANCE_GAP = 0.10
+
+string sessionTZ = input.string("Asia/Kolkata", "Session TZ", group="Session")
+int sessHour = input.int(3, "Session Start Hour", minval=0, maxval=23, group="Session")
+int sessMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group="Session")
+int mtfLookback = input.int(20, "MTF Lookback", minval=5, maxval=100, group="MTF DOM")
+bool showState = input.bool(true, "Show Trend State", group="Display")
+bool showLiquidityLevels = input.bool(true, "Show BuyLiQ/SellLiQ", group="Liquidity")
+
+var float sessionDelta = 0.0
+var float sessionHigh = na
+var float sessionLow = na
+var int barsInSession = 0
+var float buyLiq = na
+var float sellLiq = na
+var string trendState = STATE_SIDEWAYS
+var color trendColor = color.gray
+var table stateBox = na
+var array<float> sessionDeltaHistory = array.new<float>(10, 0.0)
+var array<float> buyLiqHistory = array.new<float>(10, na)
+var array<float> sellLiqHistory = array.new<float>(10, na)
+
+f_clamp(float value, float minValue, float maxValue) =>
+    math.max(minValue, math.min(maxValue, value))
+
+f_is_new_session() =>
+    hour(time, sessionTZ) == sessHour and minute(time, sessionTZ) == sessMinute
+
+f_validate_lookback(int lookback) =>
+    bar_index >= lookback
+
+f_array_push(array<float> arr, float val) =>
+    array.unshift(arr, val)
+    if array.size(arr) > 10
+        array.pop(arr)
+
+f_dom_signal(int lookback) =>
+    float signal = SIGNAL_SIDEWAYS
+    float confidence = 0.0
+    highestPrice = ta.highest(high, lookback)
+    lowestPrice = ta.lowest(low, lookback)
+    priceRange = highestPrice - lowestPrice
+    epsilon = math.max(syminfo.mintick * 10, 0.00001)
+
+    if not na(highestPrice) and not na(lowestPrice) and priceRange > epsilon
+        upperBound = highestPrice - priceRange * UPPER_ZONE_RATIO
+        lowerBound = lowestPrice + priceRange * LOWER_ZONE_RATIO
+        totalVolume = math.sum(volume, lookback)
+        upperVolume = math.sum(high >= upperBound ? volume : 0.0, lookback)
+        lowerVolume = math.sum(low <= lowerBound ? volume : 0.0, lookback)
+        upperRatio = totalVolume > 0 ? upperVolume / totalVolume : 0.0
+        lowerRatio = totalVolume > 0 ? lowerVolume / totalVolume : 0.0
+
+        float dominance = math.abs(upperRatio - lowerRatio)
+        
+        if upperRatio > MIN_DOM_VOLUME_RATIO and dominance > DOM_DOMINANCE_GAP
+            signal := SIGNAL_STRONG_BULL
+            confidence := math.min(upperRatio, (upperRatio + lowerRatio) * 0.5)
+        else if lowerRatio > MIN_DOM_VOLUME_RATIO and dominance > DOM_DOMINANCE_GAP
+            signal := SIGNAL_STRONG_BEAR
+            confidence := math.min(lowerRatio, (upperRatio + lowerRatio) * 0.5)
+        else
+            signal := SIGNAL_SIDEWAYS
+            confidence := dominance
+
+    [signal, confidence]
+
+f_mtf_signal(float signal1, float signal5, float signal15, float confidence1, float confidence5, float confidence15) =>
+    float weight1 = 1.0
+    float weight5 = 1.5
+    float weight15 = 2.0
+    float weightSum = weight1 + weight5 + weight15
+    
+    float weightedSignal = (signal1 * weight1 + signal5 * weight5 + signal15 * weight15) / weightSum
+    float divergenceCheck = (signal1 * signal5) + (signal5 * signal15) + (signal15 * signal1)
+    
+    float finalSignal = SIGNAL_SIDEWAYS
+    
+    if divergenceCheck >= 0
+        if weightedSignal > 0.35
+            finalSignal := SIGNAL_STRONG_BULL
+        else if weightedSignal > 0.05
+            finalSignal := SIGNAL_LONG_ACCUMULATION
+        else if weightedSignal < -0.35
+            finalSignal := SIGNAL_STRONG_BEAR
+        else if weightedSignal < -0.05
+            finalSignal := SIGNAL_SHORT_ACCUMULATION
+        else
+            finalSignal := SIGNAL_SIDEWAYS
+    else
+        finalSignal := SIGNAL_SIDEWAYS
+
+    [finalSignal, math.abs(weightedSignal)]
+
+f_trend_state(bool greenBar, bool redBar, bool blackBar, float mtfSignal) =>
+    bool strongBull = mtfSignal == SIGNAL_STRONG_BULL
+    bool strongBear = mtfSignal == SIGNAL_STRONG_BEAR
+    string state = STATE_SIDEWAYS
+    color stateColor = color.new(color.gray, 50)
+
+    if blackBar
+        state := STATE_SIDEWAYS
+        stateColor := color.new(color.gray, 50)
+    else if greenBar and strongBull
+        state := STATE_STRONG_BUY
+        stateColor := color.green
+    else if greenBar
+        state := STATE_ACCUMULATION
+        stateColor := color.new(color.lime, 25)
+    else if redBar and strongBear
+        state := STATE_STRONG_SELL
+        stateColor := color.red
+    else if redBar
+        state := STATE_DISTRIBUTION
+        stateColor := color.new(color.maroon, 25)
+
+    [state, stateColor]
+
+float barDelta = close > open ? volume : close < open ? -volume : 0.0
+
+if f_is_new_session() or na(sessionHigh) or na(sessionLow)
+    if not na(sessionDelta)
+        f_array_push(sessionDeltaHistory, sessionDelta)
+    
+    sessionDelta := f_clamp(barDelta, -SESSION_DELTA_MAX, SESSION_DELTA_MAX)
+    sessionHigh := high
+    sessionLow := low
+    barsInSession := 1
+else
+    float rawDelta = sessionDelta + barDelta
+    sessionDelta := f_clamp(rawDelta, -SESSION_DELTA_MAX, SESSION_DELTA_MAX)
+    sessionHigh := math.max(sessionHigh, high)
+    sessionLow := math.min(sessionLow, low)
+    barsInSession += 1
+
+sessionRange = sessionHigh - sessionLow
+
+float minSeparation = math.max(syminfo.mintick * 100, sessionRange * 0.01)
+buyLiq := sessionRange > 0 ? math.max(sessionLow, sessionHigh - sessionRange * (1.0 - VALUE_AREA_RATIO) - minSeparation) : na
+sellLiq := sessionRange > 0 ? math.min(sessionHigh, sessionLow + sessionRange * (1.0 - VALUE_AREA_RATIO) + minSeparation) : na
+
+if not na(buyLiq) and not na(sellLiq)
+    f_array_push(buyLiqHistory, buyLiq)
+    f_array_push(sellLiqHistory, sellLiq)
+
+bool liquidityLevelsValid = not na(buyLiq) and not na(sellLiq) and buyLiq < sellLiq
+
+bool levelsReady = liquidityLevelsValid
+bool greenBar = levelsReady and close > sellLiq
+bool redBar = levelsReady and close < buyLiq
+bool blackBar = not levelsReady or (close >= buyLiq and close <= sellLiq)
+
+float deltaLineColor = sessionDelta > 0 ? DELTA_GREEN : sessionDelta < 0 ? DELTA_RED : DELTA_BLACK
+
+bool lookbackValid1 = f_validate_lookback(mtfLookback)
+bool lookbackValid5 = f_validate_lookback(mtfLookback * 5)
+bool lookbackValid15 = f_validate_lookback(mtfLookback * 15)
+
+[signal1, confidence1] = if lookbackValid1
+    request.security(syminfo.tickerid, "1", f_dom_signal(mtfLookback), lookahead=barmerge.lookahead_off)
+else
+    [SIGNAL_SIDEWAYS, 0.0]
+
+[signal5, confidence5] = if lookbackValid5
+    request.security(syminfo.tickerid, "5", f_dom_signal(mtfLookback), lookahead=barmerge.lookahead_off)
+else
+    [SIGNAL_SIDEWAYS, 0.0]
+
+[signal15, confidence15] = if lookbackValid15
+    request.security(syminfo.tickerid, "15", f_dom_signal(mtfLookback), lookahead=barmerge.lookahead_off)
+else
+    [SIGNAL_SIDEWAYS, 0.0]
+
+[mtfDomSignal, mtfWeightedConfidence] = f_mtf_signal(signal1, signal5, signal15, confidence1, confidence5, confidence15)
+
+float mtfConfidence = math.abs(mtfWeightedConfidence)
+float safeMtfSignal = (na(mtfDomSignal) or mtfConfidence < 0.20) ? SIGNAL_SIDEWAYS : mtfDomSignal
+float safeDeltaColor = na(deltaLineColor) ? DELTA_BLACK : deltaLineColor
+
+[newState, newColor] = f_trend_state(greenBar, redBar, blackBar, safeMtfSignal)
+trendState := newState
+trendColor := newColor
+
+if barstate.islast
+    if na(stateBox)
+        stateBox := table.new(position.bottom_left, 1, 2, border_width=2, border_color=color.gray)
+
+    mtfText = safeMtfSignal == SIGNAL_STRONG_BULL ? "STRONG BULL" : safeMtfSignal == SIGNAL_LONG_ACCUMULATION ? "LONG ACCUMULATION" : safeMtfSignal == SIGNAL_STRONG_BEAR ? "STRONG BEAR" : safeMtfSignal == SIGNAL_SHORT_ACCUMULATION ? "SHORT ACCUMULATION" : "SIDEWAYS"
+    deltaText = safeDeltaColor == DELTA_GREEN ? "GREEN" : safeDeltaColor == DELTA_RED ? "RED" : "BLACK"
+    table.cell(stateBox, 0, 0, showState ? trendState : "", bgcolor=trendColor, text_color=color.white, text_size=size.huge, text_halign=text.align_center)
+
+barcolor(
+    not levelsReady ? color.black :
+    close > sellLiq ? color.green :
+    close < buyLiq ? color.red :
+    color.black
+)
+
+//plot(showLiquidityLevels ? buyLiq : na, "BuyLiQ (Session VAL)", color=color.green, linewidth=2, style=plot.style_linebr)
+//plot(showLiquidityLevels ? sellLiq : na, "SellLiQ (Session VAH)", color=color.red, linewidth=2, style=plot.style_linebr)

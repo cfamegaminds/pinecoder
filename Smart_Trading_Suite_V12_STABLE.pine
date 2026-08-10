@@ -1,0 +1,324 @@
+/ @version=6
+indicator("Smart Trading Suite V12.0 FINAL RELEASE", overlay=true, max_labels_count=500, max_bars_back=5000)
+
+STATE_STRONG_BUY = "STRONG BUY 🚀🚀🚀"
+STATE_ACCUMULATION = "LONG ACCUMULATION 📈"
+STATE_SIDEWAYS = "SIDEWAYS [⚠ WAIT]"
+STATE_DISTRIBUTION = "SHORT ACCUMULATION 📉"
+STATE_STRONG_SELL = "STRONG SELL 🚨🚨🚨"
+
+SIGNAL_STRONG_BULL = 1.0
+SIGNAL_LONG_ACCUMULATION = 0.5
+SIGNAL_SIDEWAYS = 0.0
+SIGNAL_SHORT_ACCUMULATION = -0.5
+SIGNAL_STRONG_BEAR = -1.0
+
+DELTA_GREEN = 1.0
+DELTA_BLACK = 0.0
+DELTA_RED = -1.0
+
+SESSION_DELTA_MAX = 10000.0
+MIN_DOM_VOLUME_RATIO = 0.30
+UPPER_ZONE_RATIO = 0.25
+LOWER_ZONE_RATIO = 0.25
+VALUE_AREA_RATIO = 0.30
+DOM_DOMINANCE_GAP = 0.10
+
+string sessionTZ = input.string("Asia/Kolkata", "Session TZ", group="Session")
+int sessHour = input.int(3, "Session Start Hour", minval=0, maxval=23, group="Session")
+int sessMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group="Session")
+int mtfLookback = input.int(20, "MTF Lookback", minval=5, maxval=100, group="MTF DOM")
+float sidewaysThreshold = input.float(0.20, "Sideways Confidence Threshold", minval=0.05, maxval=0.50, group="MTF DOM")
+
+bool showState = input.bool(true, "Show Trend State", group="Display")
+bool showLiquidityLevels = input.bool(true, "Show BuyLiQ/SellLiQ", group="Liquidity")
+bool showConfidenceScore = input.bool(true, "Plot Signal Confidence", group="Display")
+bool showConfluence = input.bool(true, "Plot Confluence Score (0-3)", group="Display")
+bool showDebugTable = input.bool(false, "Show Debug Table", group="Debug")
+
+string alertTemplate_Long = input.string("LONG: {{ticker}} — Confidence {{confidence}}", "Long Alert Template", group="Alerts")
+string alertTemplate_Short = input.string("SHORT: {{ticker}} — Confidence {{confidence}}", "Short Alert Template", group="Alerts")
+bool enableAlerts = input.bool(false, "Enable Alerts", group="Alerts")
+
+var float sessionDelta = 0.0
+var float sessionHigh = na
+var float sessionLow = na
+var int barsInSession = 0
+var float buyLiq = na
+var float sellLiq = na
+var float buyLiqPrior = na
+var float sellLiqPrior = na
+var string trendState = STATE_SIDEWAYS
+var string trendStatePrior = STATE_SIDEWAYS
+var color trendColor = color.gray
+var table stateBox = na
+var table debugTable = na
+var array<float> sessionDeltaHistory = array.new<float>(10, 0.0)
+var array<float> buyLiqHistory = array.new<float>(10, na)
+var array<float> sellLiqHistory = array.new<float>(10, na)
+var bool barClosed = false
+var float signalConfidenceOut = 0.0
+var float confluenceScoreOut = 0.0
+
+f_clamp(float value, float minValue, float maxValue) =>
+    math.max(minValue, math.min(maxValue, value))
+
+f_is_new_session() =>
+    hour(time, sessionTZ) == sessHour and minute(time, sessionTZ) == sessMinute
+
+f_validate_lookback(int lookback) =>
+    bar_index >= lookback
+
+f_array_push(array<float> arr, float val) =>
+    array.unshift(arr, val)
+    if array.size(arr) > 10
+        array.pop(arr)
+
+f_dom_signal(int lookback) =>
+    float signal = SIGNAL_SIDEWAYS
+    float confidence = 0.0
+    highestPrice = ta.highest(high, lookback)
+    lowestPrice = ta.lowest(low, lookback)
+    priceRange = highestPrice - lowestPrice
+    epsilon = math.max(syminfo.mintick * 10, 0.00001)
+
+    if not na(highestPrice) and not na(lowestPrice) and priceRange > epsilon
+        upperBound = highestPrice - priceRange * UPPER_ZONE_RATIO
+        lowerBound = lowestPrice + priceRange * LOWER_ZONE_RATIO
+        totalVolume = math.sum(volume, lookback)
+        upperVolume = math.sum(high >= upperBound ? volume : 0.0, lookback)
+        lowerVolume = math.sum(low <= lowerBound ? volume : 0.0, lookback)
+        upperRatio = totalVolume > 0 ? upperVolume / totalVolume : 0.0
+        lowerRatio = totalVolume > 0 ? lowerVolume / totalVolume : 0.0
+
+        float dominance = math.abs(upperRatio - lowerRatio)
+        
+        if upperRatio > MIN_DOM_VOLUME_RATIO and dominance > DOM_DOMINANCE_GAP
+            signal := SIGNAL_STRONG_BULL
+            confidence := math.min(upperRatio, (upperRatio + lowerRatio) * 0.5)
+        else if lowerRatio > MIN_DOM_VOLUME_RATIO and dominance > DOM_DOMINANCE_GAP
+            signal := SIGNAL_STRONG_BEAR
+            confidence := math.min(lowerRatio, (upperRatio + lowerRatio) * 0.5)
+        else
+            signal := SIGNAL_SIDEWAYS
+            confidence := dominance
+
+    [signal, confidence]
+
+f_mtf_signal(float signal1, float signal5, float signal15, float confidence1, float confidence5, float confidence15) =>
+    float weight1 = 1.0
+    float weight5 = 1.5
+    float weight15 = 2.0
+    float weightSum = weight1 + weight5 + weight15
+    
+    float weightedSignal = (signal1 * weight1 + signal5 * weight5 + signal15 * weight15) / weightSum
+    float divergenceCheck = (signal1 * signal5) + (signal5 * signal15) + (signal15 * signal1)
+    
+    float finalSignal = SIGNAL_SIDEWAYS
+    
+    if divergenceCheck >= 0
+        if weightedSignal > 0.35
+            finalSignal := SIGNAL_STRONG_BULL
+        else if weightedSignal > 0.05
+            finalSignal := SIGNAL_LONG_ACCUMULATION
+        else if weightedSignal < -0.35
+            finalSignal := SIGNAL_STRONG_BEAR
+        else if weightedSignal < -0.05
+            finalSignal := SIGNAL_SHORT_ACCUMULATION
+        else
+            finalSignal := SIGNAL_SIDEWAYS
+    else
+        finalSignal := SIGNAL_SIDEWAYS
+
+    [finalSignal, math.abs(weightedSignal)]
+
+f_trend_state(bool greenBar, bool redBar, bool blackBar, float mtfSignal) =>
+    bool strongBull = mtfSignal == SIGNAL_STRONG_BULL
+    bool strongBear = mtfSignal == SIGNAL_STRONG_BEAR
+    string state = STATE_SIDEWAYS
+    color stateColor = color.new(color.gray, 50)
+
+    if blackBar
+        state := STATE_SIDEWAYS
+        stateColor := color.new(color.gray, 50)
+    else if greenBar and strongBull
+        state := STATE_STRONG_BUY
+        stateColor := color.green
+    else if greenBar
+        state := STATE_ACCUMULATION
+        stateColor := color.new(color.lime, 25)
+    else if redBar and strongBear
+        state := STATE_STRONG_SELL
+        stateColor := color.red
+    else if redBar
+        state := STATE_DISTRIBUTION
+        stateColor := color.new(color.maroon, 25)
+
+    [state, stateColor]
+
+float barDelta = close > open ? volume : close < open ? -volume : 0.0
+
+if f_is_new_session() or na(sessionHigh) or na(sessionLow)
+    if not na(sessionDelta)
+        f_array_push(sessionDeltaHistory, sessionDelta)
+    
+    sessionDelta := f_clamp(barDelta, -SESSION_DELTA_MAX, SESSION_DELTA_MAX)
+    sessionHigh := high
+    sessionLow := low
+    barsInSession := 1
+else
+    float rawDelta = sessionDelta + barDelta
+    sessionDelta := f_clamp(rawDelta, -SESSION_DELTA_MAX, SESSION_DELTA_MAX)
+    sessionHigh := math.max(sessionHigh, high)
+    sessionLow := math.min(sessionLow, low)
+    barsInSession += 1
+
+sessionRange = sessionHigh - sessionLow
+
+float minSeparation = math.max(syminfo.mintick * 100, sessionRange * 0.01)
+buyLiq := sessionRange > 0 ? math.min(sessionLow, sessionLow + sessionRange * (1.0 - VALUE_AREA_RATIO) + minSeparation) : na
+sellLiq := sessionRange > 0 ? math.max(sessionHigh, sessionHigh - sessionRange * (1.0 - VALUE_AREA_RATIO) - minSeparation) : na
+
+if not na(buyLiq) and not na(sellLiq)
+    f_array_push(buyLiqHistory, buyLiq)
+    f_array_push(sellLiqHistory, sellLiq)
+
+bool liquidityLevelsValid = not na(buyLiq) and not na(sellLiq) and buyLiq < sellLiq
+
+bool levelsReady = liquidityLevelsValid
+bool greenBar = levelsReady and close > sellLiq
+bool redBar = levelsReady and close < buyLiq
+bool blackBar = not levelsReady or (close >= buyLiq and close <= sellLiq)
+
+float deltaLineColor = sessionDelta > 0 ? DELTA_GREEN : sessionDelta < 0 ? DELTA_RED : DELTA_BLACK
+
+bool lookbackValid1 = f_validate_lookback(mtfLookback)
+bool lookbackValid5 = f_validate_lookback(mtfLookback * 5)
+bool lookbackValid15 = f_validate_lookback(mtfLookback * 15)
+
+[signal1, confidence1] = if lookbackValid1
+    request.security(syminfo.tickerid, "1", f_dom_signal(mtfLookback), lookahead=barmerge.lookahead_off)
+else
+    [SIGNAL_SIDEWAYS, 0.0]
+
+[signal5, confidence5] = if lookbackValid5
+    request.security(syminfo.tickerid, "5", f_dom_signal(mtfLookback), lookahead=barmerge.lookahead_off)
+else
+    [SIGNAL_SIDEWAYS, 0.0]
+
+[signal15, confidence15] = if lookbackValid15
+    request.security(syminfo.tickerid, "15", f_dom_signal(mtfLookback), lookahead=barmerge.lookahead_off)
+else
+    [SIGNAL_SIDEWAYS, 0.0]
+
+[mtfDomSignal, mtfWeightedConfidence] = f_mtf_signal(signal1, signal5, signal15, confidence1, confidence5, confidence15)
+
+float mtfConfidence = math.abs(mtfWeightedConfidence)
+float safeMtfSignal = (na(mtfDomSignal) or mtfConfidence < sidewaysThreshold) ? SIGNAL_SIDEWAYS : mtfDomSignal
+float safeDeltaColor = na(deltaLineColor) ? DELTA_BLACK : deltaLineColor
+
+// Confidence Score: Measure of signal strength (0-1). Higher = more reliable.
+float signalConfidence = 0.0
+if safeMtfSignal == SIGNAL_STRONG_BULL
+    signalConfidence := math.min(0.95, mtfConfidence + 0.3)
+else if safeMtfSignal == SIGNAL_STRONG_BEAR
+    signalConfidence := math.min(0.95, mtfConfidence + 0.3)
+else if safeMtfSignal == SIGNAL_LONG_ACCUMULATION
+    signalConfidence := math.min(0.85, mtfConfidence + 0.15)
+else if safeMtfSignal == SIGNAL_SHORT_ACCUMULATION
+    signalConfidence := math.min(0.85, mtfConfidence + 0.15)
+else
+    signalConfidence := math.max(0.0, mtfConfidence * 0.3)
+
+signalConfidenceOut := signalConfidence
+
+// Confluence Score (0-3): Multi-factor alignment
+// 1 pt: Session delta bullish | 1 pt: MTF signal bullish | 1 pt: Bar color bullish (same for bear)
+float confluenceScore = 0.0
+bool bullSessionDelta = sessionDelta > 0
+bool bullMTFSignal = safeMtfSignal > 0
+bool bullBarColor = greenBar
+confluenceScore := (bullSessionDelta ? 1.0 : 0.0) + (bullMTFSignal ? 1.0 : 0.0) + (bullBarColor ? 1.0 : 0.0)
+confluenceScoreOut := confluenceScore
+
+// 1-BAR LAG LOGIC: Commit levels when new bar opens (stable coloring)
+if barstate.isnew
+    barClosed := true
+    buyLiqPrior := buyLiq
+    sellLiqPrior := sellLiq
+if barstate.islast
+    barClosed := false
+
+// Use PRIOR levels for current bar coloring (1-bar delay eliminates repaint)
+bool levelsReadyDisplay = barClosed and not na(buyLiqPrior) and not na(sellLiqPrior) and buyLiqPrior < sellLiqPrior
+bool greenBarDisplay = levelsReadyDisplay and close > sellLiqPrior
+bool redBarDisplay = levelsReadyDisplay and close < buyLiqPrior
+bool blackBarDisplay = not levelsReadyDisplay or (close >= buyLiqPrior and close <= sellLiqPrior)
+
+[newState, newColor] = f_trend_state(greenBarDisplay, redBarDisplay, blackBarDisplay, safeMtfSignal)
+trendStatePrior := trendState
+trendState := newState
+trendColor := newColor
+
+// STATE CHANGE DETECTION (for alerts)
+bool stateChanged = trendState != trendStatePrior
+if enableAlerts and stateChanged
+    if trendState == STATE_STRONG_BUY or trendState == STATE_ACCUMULATION
+        alertMsg = str.replace(alertTemplate_Long, "{{ticker}}", syminfo.tickerid)
+        alertMsg := str.replace(alertMsg, "{{confidence}}", str.tostring(signalConfidence, "0.00"))
+        alert(alertMsg, alert.freq_once_per_bar)
+    else if trendState == STATE_STRONG_SELL or trendState == STATE_DISTRIBUTION
+        alertMsg = str.replace(alertTemplate_Short, "{{ticker}}", syminfo.tickerid)
+        alertMsg := str.replace(alertMsg, "{{confidence}}", str.tostring(signalConfidence, "0.00"))
+        alert(alertMsg, alert.freq_once_per_bar)
+
+if barstate.islast
+    // STATE DISPLAY BOX
+    if na(stateBox)
+        stateBox := table.new(position.bottom_left, 1, 2, border_width=2, border_color=color.gray)
+
+    mtfText = safeMtfSignal == SIGNAL_STRONG_BULL ? "STRONG BULL" : safeMtfSignal == SIGNAL_LONG_ACCUMULATION ? "LONG ACCUMULATION" : safeMtfSignal == SIGNAL_STRONG_BEAR ? "STRONG BEAR" : safeMtfSignal == SIGNAL_SHORT_ACCUMULATION ? "SHORT ACCUMULATION" : "SIDEWAYS"
+    deltaText = safeDeltaColor == DELTA_GREEN ? "GREEN" : safeDeltaColor == DELTA_RED ? "RED" : "BLACK"
+    table.cell(stateBox, 0, 0, showState ? trendState : "", bgcolor=trendColor, text_color=color.white, text_size=size.huge, text_halign=text.align_center)
+
+    // DEBUG TABLE (optional)
+    if showDebugTable
+        if na(debugTable)
+            debugTable := table.new(position.top_right, 2, 7, border_width=1, border_color=color.gray)
+            table.cell(debugTable, 0, 0, "DEBUG", bgcolor=color.gray, text_color=color.white, text_size=size.small)
+        
+        table.cell(debugTable, 0, 1, "sessionDelta", text_size=size.small)
+        table.cell(debugTable, 1, 1, str.tostring(sessionDelta, "0.0"), text_size=size.small)
+        
+        table.cell(debugTable, 0, 2, "buyLiq/sellLiq", text_size=size.small)
+        table.cell(debugTable, 1, 2, str.tostring(buyLiq, "0.00") + " / " + str.tostring(sellLiq, "0.00"), text_size=size.small)
+        
+        table.cell(debugTable, 0, 3, "Levels Valid", text_size=size.small)
+        table.cell(debugTable, 1, 3, liquidityLevelsValid ? "✓" : "✗", text_size=size.small, bgcolor=liquidityLevelsValid ? color.green : color.red)
+        
+        table.cell(debugTable, 0, 4, "MTF Confidence", text_size=size.small)
+        table.cell(debugTable, 1, 4, str.tostring(mtfConfidence, "0.00"), text_size=size.small)
+        
+        table.cell(debugTable, 0, 5, "Signal Confidence", text_size=size.small)
+        table.cell(debugTable, 1, 5, str.tostring(signalConfidence, "0.00"), text_size=size.small)
+        
+        table.cell(debugTable, 0, 6, "Confluence Score", text_size=size.small)
+        table.cell(debugTable, 1, 6, str.tostring(confluenceScore, "0.0"), text_size=size.small)
+
+// BAR COLORING (uses prior levels for stable repaint-free coloring)
+barcolor(
+    not levelsReadyDisplay ? color.black :
+    close > sellLiqPrior ? color.green :
+    close < buyLiqPrior ? color.red :
+    color.black
+)
+
+// SIGNAL CONFIDENCE PLOT (0-1 scale)
+plot(showConfidenceScore ? signalConfidence : na, "Signal Confidence", color=color.orange, linewidth=2, style=plot.style_line)
+
+// CONFLUENCE SCORE PLOT (0-3 scale: multi-factor alignment)
+plot(showConfluence ? confluenceScore : na, "Confluence (0-3)", color=color.blue, linewidth=2, style=plot.style_line)
+
+// LIQUIDITY LEVELS (hidden by default, uncomment to plot)
+//plot(showLiquidityLevels ? buyLiq : na, "BuyLiQ (Session VAL)", color=color.green, linewidth=2, style=plot.style_linebr)
+//plot(showLiquidityLevels ? sellLiq : na, "SellLiQ (Session VAH)", color=color.red, linewidth=2, style=plot.style_linebr)

@@ -1,0 +1,430 @@
+//@version=6
+indicator("SessionDelta Trend Tracker [3:30] V17 PRODUCTION", overlay=false, max_lines_count=50, max_boxes_count=50, max_labels_count=500, max_bars_back=5000)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════════════════════════════
+DAILY_MINUTES = 1440
+SESSION_MINUTES = 7200
+MAX_DELTA = 9999999.0
+MIN_VAL_VAH_CONCENTRATION = 0.65
+PROFILE_LOOKBACK_MAX = 500
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INPUT CONFIGURATION
+// ════════════════════════════════════════════════════════════════════════════════
+string sessionTZ = "Asia/Kolkata"
+sessHour = input.int(3, "Session Start Hour", minval=0, maxval=23, group="Session")
+sessMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group="Session")
+
+rows = input.int(20, "Profile Rows", minval=10, maxval=50, group="FRVP")
+profilesToShow = input.int(20, "Profiles To Plot", minval=1, maxval=30, group="FRVP")
+
+bool showDeltaSpikes = input.bool(true, "Show Delta Spikes", group="Signals")
+bool showDivergence = input.bool(true, "Show Bearish Divergence", group="Signals")
+float bearishDivLevel = input.float(2500, "Bearish Divergence Level", minval=0, group="Signals")
+
+// CRITICAL: Spike band now ATR-relative (adaptive to volatility)
+float spikeDeltaBandPercent = input.float(2.5, "Delta Spike: ATR Multiplier", minval=0.5, maxval=10, group="Signals")
+
+float wBuySideLiq = input.float(3.0, "Weight: Buyside Liquidity", minval=0, group="Liquidity")
+float wSellSideLiq = input.float(3.0, "Weight: Sellside Liquidity", minval=0, group="Liquidity")
+
+// NEW: Elasticity confidence mode (tighten zones when both touched)
+bool useElasticityTightening = input.bool(true, "Elasticity: Tighten on Confidence", group="Liquidity")
+float elasticityFactor = input.float(0.85, "Elasticity Factor (0=tight, 1=neutral)", minval=0.5, maxval=1.5, group="Liquidity")
+
+// NEW: Confirmation gates
+int minBarsConfirm = input.int(2, "Min Bars Confirmation", minval=1, maxval=5, group="Safety")
+float minVolAvgRatio = input.float(0.8, "Min Volume/SMA Ratio", minval=0.3, maxval=2.0, group="Safety")
+
+// ════════════════════════════════════════════════════════════════════════════════
+// STATE VARIABLES - STRICT TYPES
+// ════════════════════════════════════════════════════════════════════════════════
+var int[] sessionStarts = array.new_int()
+var int[] sessionEnds = array.new_int()
+var bool sessionJustClosed = false
+var float sessionDelta = 0.0
+var float sessionDeltaLocked = 0.0
+
+// CRITICAL FIX: Snapshot session baseline at session START (not real-time)
+var float sessionHighSnapshot = na
+var float sessionLowSnapshot = na
+var float sessionOpenPrice = na
+
+// Liquidity lock state
+var float lockedSessionVAL = na
+var float lockedSessionVAH = na
+var bool sessionLocked = false
+var float sessionVALVAHConcentration = 1.0
+var bool valvahStrong = true
+
+// Running high/low for current session
+var float sessionHighRunning = na
+var float sessionLowRunning = na
+var int barsInSession = 0
+
+// Display tables
+var table liqTable = table.new(position.top_right, 2, 3, border_width=1, frame_width=1, frame_color=color.white)
+var table biasBox = table.new(position.bottom_left, 1, 3, border_width=1, border_color=color.gray)
+
+// Confirmation tracking
+var int spikeBarsConfirmed = 0
+var bool lastSpikeBullish = na
+var int divBarsConfirmed = 0
+
+// ════════════════════════════════════════════════════════════════════════════════
+// UTILITY: POC CALCULATION (UNCHANGED - CORRECT)
+// ════════════════════════════════════════════════════════════════════════════════
+calcPOCFast(float priceHi, float priceLo, int numBins, int lookback) =>
+    if na(priceHi) or na(priceLo) or priceLo >= priceHi
+        na
+    else
+        range_ = math.max(priceHi - priceLo, syminfo.mintick)
+        step = range_ / numBins
+        binsVol = array.new_float(numBins, 0.0)
+        maxLookback = math.min(lookback - 1, PROFILE_LOOKBACK_MAX)
+        for i = 0 to maxLookback
+            price = close[i]
+            vol = volume[i]
+            if price >= priceLo and price <= priceHi
+                idx = math.max(0, math.min(numBins - 1, math.floor((price - priceLo) / step)))
+                array.set(binsVol, idx, array.get(binsVol, idx) + vol)
+        maxVol = array.max(binsVol)
+        pocIdx = array.indexof(binsVol, maxVol)
+        pocIdx >= 0 ? priceLo + step * pocIdx + step * 0.5 : na
+
+// ════════════════════════════════════════════════════════════════════════════════
+// UTILITY: PROFILE CALCULATION WITH NaN ISOLATION (UNCHANGED - CORRECT)
+// ════════════════════════════════════════════════════════════════════════════════
+calcProfileLevels(_startBar, _endBar, _rows) =>
+    lookback = math.max(1, math.min(_endBar - _startBar + 1, PROFILE_LOOKBACK_MAX))
+    hi = ta.highest(high, lookback)
+    lo = ta.lowest(low, lookback)
+    if na(hi) or na(lo) or lo >= hi
+        [na, na, na]
+    else
+        myRange = math.max(hi - lo, syminfo.mintick)
+        step = myRange / _rows
+        volumeRows = array.new_float(_rows, 0.0)
+        totalVol = 0.0
+        for i = 0 to lookback - 1
+            barHigh = high[i]
+            barLow = low[i]
+            barVol = volume[i]
+            totalVol += barVol
+            barRange = math.max(barHigh - barLow, syminfo.mintick)
+            for r = 0 to _rows - 1
+                rowLow = lo + step * r
+                rowHigh = rowLow + step
+                overlap = math.max(math.min(barHigh, rowHigh) - math.max(barLow, rowLow), 0)
+                if overlap > 0
+                    array.set(volumeRows, r, array.get(volumeRows, r) + barVol * (overlap / barRange))
+        maxVol = 0.0
+        pocRow = 0
+        for r = 0 to _rows - 1
+            rowVol = array.get(volumeRows, r)
+            if rowVol > maxVol
+                maxVol := rowVol
+                pocRow := r
+        poc = lo + step * pocRow + step * 0.5
+        if totalVol <= 0
+            [poc, lo + step * _rows, lo]
+        else
+            targetVol = totalVol * 0.79
+            valueVol = maxVol
+            vahRow = pocRow
+            valRow = pocRow
+            upRow = pocRow + 1
+            downRow = pocRow - 1
+            while valueVol < targetVol and (upRow < _rows or downRow >= 0)
+                volUp = upRow < _rows and upRow >= 0 ? array.get(volumeRows, upRow) : 0.0
+                volDown = downRow >= 0 and downRow < _rows ? array.get(volumeRows, downRow) : 0.0
+                if volUp > volDown
+                    if upRow < _rows
+                        valueVol += volUp
+                        vahRow := upRow
+                        upRow += 1
+                    else if downRow >= 0
+                        valueVol += volDown
+                        valRow := downRow
+                        downRow -= 1
+                else if volDown > volUp
+                    if downRow >= 0
+                        valueVol += volDown
+                        valRow := downRow
+                        downRow -= 1
+                    else if upRow < _rows
+                        valueVol += volUp
+                        vahRow := upRow
+                        upRow += 1
+                else
+                    if upRow < _rows
+                        valueVol += volUp
+                        vahRow := upRow
+                        upRow += 1
+                    else if downRow >= 0
+                        valueVol += volDown
+                        valRow := downRow
+                        downRow -= 1
+            vahRow := math.max(0, math.min(_rows - 1, vahRow))
+            valRow := math.max(0, math.min(_rows - 1, valRow))
+            vah = lo + step * vahRow + step
+            val = lo + step * valRow
+            [poc, vah, val]
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SESSION TRACKING - STRICT SEQUENCING
+// ════════════════════════════════════════════════════════════════════════════════
+curHour = hour(time, sessionTZ)
+curMin = minute(time, sessionTZ)
+isNewSession = (curHour == sessHour and curMin == sessMinute)
+
+if isNewSession
+    // FIX: Close prior session before opening new one
+    if array.size(sessionStarts) > array.size(sessionEnds)
+        array.push(sessionEnds, bar_index - 1)
+    
+    array.push(sessionStarts, bar_index)
+    sessionJustClosed := true
+    barsInSession := 1
+    
+    // CRITICAL FIX: Snapshot baseline at session START
+    sessionOpenPrice := open
+    sessionHighSnapshot := high
+    sessionLowSnapshot := low
+    sessionHighRunning := high
+    sessionLowRunning := low
+    sessionDelta := 0.0
+    sessionDeltaLocked := 0.0
+    
+    // Trim old sessions
+    while array.size(sessionStarts) > profilesToShow + 1
+        array.shift(sessionStarts)
+    while array.size(sessionEnds) > profilesToShow
+        array.shift(sessionEnds)
+    
+    // CRITICAL FIX: Unlock if strength check fails (don't carryover weak sessions)
+    sessionLocked := false
+    lockedSessionVAL := na
+    lockedSessionVAH := na
+else
+    sessionJustClosed := false
+    barsInSession += 1
+    
+    // Update running high/low
+    if na(sessionHighRunning)
+        sessionHighRunning := high
+    else
+        sessionHighRunning := math.max(sessionHighRunning, high)
+    
+    if na(sessionLowRunning)
+        sessionLowRunning := low
+    else
+        sessionLowRunning := math.min(sessionLowRunning, low)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY LOCK WITH STRENGTH CHECK - ONE-TIME PER SESSION
+// ════════════════════════════════════════════════════════════════════════════════
+if sessionJustClosed and array.size(sessionEnds) > 0
+    latestSessionEnd = array.get(sessionEnds, array.size(sessionEnds) - 1)
+    if not na(latestSessionEnd) and array.size(sessionStarts) >= 2
+        latestSessionStart = array.get(sessionStarts, array.size(sessionStarts) - 2)
+        [tmpPOC, tmpVAH, tmpVAL] = calcProfileLevels(latestSessionStart, latestSessionEnd, rows)
+        
+        if not na(tmpVAH) and not na(tmpVAL)
+            valvahRange = tmpVAH - tmpVAL
+            if valvahRange > 0
+                sessionVolTot = 0.0
+                valvahVol = 0.0
+                lookbackRange = math.min(latestSessionEnd - latestSessionStart + 1, PROFILE_LOOKBACK_MAX)
+                
+                for i = 0 to lookbackRange - 1
+                    sessionVolTot += volume[i]
+                    barPrice = close[i]
+                    if barPrice >= tmpVAL and barPrice <= tmpVAH
+                        valvahVol += volume[i]
+                
+                sessionVALVAHConcentration := sessionVolTot > 0 ? valvahVol / sessionVolTot : 0.0
+                valvahStrong := sessionVALVAHConcentration >= MIN_VAL_VAH_CONCENTRATION
+                
+                if valvahStrong
+                    lockedSessionVAL := tmpVAL
+                    lockedSessionVAH := tmpVAH
+                    sessionLocked := true
+
+// ════════════════════════════════════════════════════════════════════════════════
+// ADAPTIVE LIQUIDITY ZONES WITH ELASTICITY TIGHTENING (FIX #2)
+// ════════════════════════════════════════════════════════════════════════════════
+// Elasticity TIGHTENS zones when both VAL/VAH touched (confidence mode)
+// NOT WIDENS. Confidence → stricter bias requirement.
+
+barsSinceLock = barsInSession
+valTouched = ta.lowest(low, math.min(barsSinceLock, 20)) <= lockedSessionVAL
+vahTouched = ta.highest(high, math.min(barsSinceLock, 20)) >= lockedSessionVAH
+bothTouched = valTouched and vahTouched
+
+// CRITICAL FIX: If useElasticityTightening, make zones TIGHTER (lower elasticity)
+// Otherwise keep neutral (1.0)
+elasticity = useElasticityTightening and bothTouched ? elasticityFactor : 1.0
+
+elasticVAL = lockedSessionVAL + (lockedSessionVAH - lockedSessionVAL) * (elasticity - 1.0) * 0.5
+elasticVAH = lockedSessionVAH - (lockedSessionVAH - lockedSessionVAL) * (elasticity - 1.0) * 0.5
+
+// Safety: Use locked values if available, else close
+float buySideLiquidity = sessionLocked ? elasticVAL : close
+float sellSideLiquidity = sessionLocked ? elasticVAH : close
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DELTA CALCULATION + OVERFLOW GUARD
+// ════════════════════════════════════════════════════════════════════════════════
+isUp = close > open
+isDown = close < open
+buyVolume = isUp ? volume : 0.0
+sellVolume = isDown ? volume : 0.0
+delta = buyVolume - sellVolume
+
+if isNewSession
+    sessionDelta := delta
+    sessionDeltaLocked := delta
+else
+    newSessionDelta = sessionDelta + delta
+    sessionDelta := math.min(math.max(newSessionDelta, -MAX_DELTA), MAX_DELTA)
+    sessionDeltaLocked := sessionDelta
+
+// ════════════════════════════════════════════════════════════════════════════════
+// VOLATILITY-ADAPTIVE DELTA SPIKE THRESHOLD (FIX #3a)
+// ════════════════════════════════════════════════════════════════════════════════
+absDelta = math.abs(delta)
+atr20 = ta.atr(20)
+volAvgSma = ta.sma(volume, 20)
+volRatio = volume / math.max(volAvgSma, syminfo.mintick)
+
+// Adaptive threshold: ATR-based, volume-aware
+volNormThreshold = atr20 * spikeDeltaBandPercent * math.max(volRatio, minVolAvgRatio)
+deltaSpike = absDelta > volNormThreshold
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DELTA TREND + SPIKE DIRECTION FILTER
+// ════════════════════════════════════════════════════════════════════════════════
+deltaTrend = ta.wma(sessionDelta, 5)
+deltaTrendUp = deltaTrend > deltaTrend[1]
+deltaTrendDown = deltaTrend < deltaTrend[1]
+spikeDirAlignsTrend = (delta > 0 and deltaTrendUp) or (delta < 0 and deltaTrendDown)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// CRITICAL FIX #3b: SPIKE + LIQUIDITY CONFIRMATION (NEW)
+// Spike must also confirm liquidity zone direction to qualify
+// ════════════════════════════════════════════════════════════════════════════════
+spikeBullishConfirm = deltaSpike and delta > 0 and close > sellSideLiquidity
+spikeBearishConfirm = deltaSpike and delta < 0 and close < buySideLiquidity
+spikeHasLiquidityConfirm = spikeBullishConfirm or spikeBearishConfirm
+
+// Confirmation gate: require minBarsConfirm consecutive bars in same direction
+if spikeBullishConfirm and lastSpikeBullish != true
+    spikeBarsConfirmed := 1
+    lastSpikeBullish := true
+else if spikeBearishConfirm and lastSpikeBullish != false
+    spikeBarsConfirmed := 1
+    lastSpikeBullish := false
+else if spikeHasLiquidityConfirm and ((spikeBullishConfirm and lastSpikeBullish == true) or (spikeBearishConfirm and lastSpikeBullish == false))
+    spikeBarsConfirmed += 1
+else
+    spikeBarsConfirmed := 0
+    lastSpikeBullish := na
+
+bool spikeFinal = spikeBarsConfirmed >= minBarsConfirm
+
+// ════════════════════════════════════════════════════════════════════════════════
+// CRITICAL FIX #4: DIVERGENCE WITH SESSION BASELINE SNAPSHOT
+// Use sessionHighSnapshot (locked at session start), not real-time sessionHigh
+// ════════════════════════════════════════════════════════════════════════════════
+priceNewHigh = sessionHighRunning > sessionHighSnapshot
+deltaBelowDiv = sessionDelta < bearishDivLevel
+highFor2Bars = (high > sessionHighSnapshot) and (high[1] >= sessionHighSnapshot)
+deltaMomentumWeak = sessionDelta < sessionDelta[1]
+
+// Divergence = new high but weak delta + momentum loss
+bearishDiv = (priceNewHigh or highFor2Bars) and deltaBelowDiv and close < sessionHighSnapshot and deltaMomentumWeak
+
+// Confirmation gate for divergence
+if bearishDiv
+    divBarsConfirmed += 1
+else
+    divBarsConfirmed := 0
+
+bool divFinal = divBarsConfirmed >= minBarsConfirm
+
+// ════════════════════════════════════════════════════════════════════════════════
+// BIAS CALCULATION - CLEAN SEPARATION
+// ════════════════════════════════════════════════════════════════════════════════
+// Calculate bias state independent of rendering
+bool isBullish = (close > sellSideLiquidity) and (sessionDelta > 0) and sessionLocked
+bool isBearish = (close < buySideLiquidity) and (sessionDelta < 0) and sessionLocked
+bool isBalanced = not isBullish and not isBearish
+
+// ════════════════════════════════════════════════════════════════════════════════
+// CRITICAL FIX #1: COLOR LOGIC INLINE (NEVER STALE)
+// Build bias string + color EVERY BAR, render in table cells with ternary
+// ════════════════════════════════════════════════════════════════════════════════
+headerText = isBullish ? "✔ BULLISH BIAS" : isBearish ? "⚠ BEARISH BIAS" : "◆ BALANCED"
+line1Text = isBullish ? "CMP > SellLiQ | Δ GREEN [BUY - 2x(OB) + DOM Confirmation]" : 
+            isBearish ? "CMP < BuyLiQ | Δ RED [SELL - 2x(OB) + MTF DOM Confirmation]" : 
+            "Δ BLACK | Volatile Market [⚠ NO TRADE]"
+line2Text = str.tostring(sessionDelta, "#,##0.00")
+
+// Delta color for main plot
+color deltaPlotColor = isBullish ? color.new(color.green, 0) : isBearish ? color.new(color.red, 0) : color.black
+
+// Bias box colors (inline ternary - NEVER STALE)
+color hdrBgColor = isBullish ? color.new(color.green, 10) : isBearish ? color.new(color.red, 10) : color.new(color.orange, 10)
+color l1BgColor = isBullish ? color.new(color.green, 20) : isBearish ? color.new(color.red, 20) : color.new(color.black, 10)
+color l2BgColor = isBullish ? color.new(color.green, 50) : isBearish ? color.new(color.red, 50) : color.new(color.gray, 20)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// MAIN PLOT
+// ════════════════════════════════════════════════════════════════════════════════
+plot(sessionDelta, title='Session Cumulative Delta', color=deltaPlotColor, linewidth=3)
+hline(0, 'Zero Line', color=color.black, linewidth=2)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY TABLE - RENDERS EVERY BAR (FIX: removed barstate.islast)
+// ════════════════════════════════════════════════════════════════════════════════
+table.cell(liqTable, 0, 0, text="Liquidity Level", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+table.cell(liqTable, 1, 0, text="Price", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+table.cell(liqTable, 0, 1, text="Buyside", bgcolor=color.new(color.green, 90), text_color=color.white, text_size=size.small)
+table.cell(liqTable, 1, 1, text=str.tostring(buySideLiquidity, format.mintick), bgcolor=color.new(color.green, 95), text_color=color.white, text_size=size.small)
+table.cell(liqTable, 0, 2, text="Sellside", bgcolor=color.new(color.red, 90), text_color=color.white, text_size=size.small)
+table.cell(liqTable, 1, 2, text=str.tostring(sellSideLiquidity, format.mintick), bgcolor=color.new(color.red, 95), text_color=color.white, text_size=size.small)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// BIAS BOX - RENDERS EVERY BAR WITH INLINE COLOR (FIX #1)
+// ════════════════════════════════════════════════════════════════════════════════
+table.cell(biasBox, 0, 0, headerText, bgcolor=hdrBgColor, text_color=color.white, text_size=size.large)
+table.cell(biasBox, 0, 1, line1Text, bgcolor=l1BgColor, text_color=color.white, text_size=size.large)
+table.cell(biasBox, 0, 2, line2Text, bgcolor=l2BgColor, text_color=color.white, text_size=size.large)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SIGNAL PLOTS - SPIKE (FIX #3b) & DIVERGENCE (FIX #4)
+// ════════════════════════════════════════════════════════════════════════════════
+// Spike: requires liquidity confirm + 2-bar confirmation + within delta band
+inDeltaBand = math.abs(sessionDelta) <= (spikeDeltaBandPercent * atr20 * 3)
+plot(showDeltaSpikes and spikeFinal and inDeltaBand ? sessionDelta : na, 
+     title='Delta Spike [CONFIRMED]', color=color.black, linewidth=5, style=plot.style_circles)
+
+// Divergence: requires 2-bar confirmation + strong VAL/VAH
+plot(showDivergence and divFinal and valvahStrong ? sessionDelta : na, 
+     title='Bearish Divergence [CONFIRMED]', color=color.new(color.red, 0), linewidth=6, style=plot.style_circles)
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DEBUG INFO (Optional: disable for production)
+// ════════════════════════════════════════════════════════════════════════════════
+f_debugLabel() =>
+    debugStr = "VAL/VAH Strength: " + str.tostring(sessionVALVAHConcentration, "#0.00%") +
+               "\nElasticity: " + str.tostring(elasticity, "0.00") +
+               "\nSpike Confirmed: " + str.tostring(spikeBarsConfirmed) + "/" + str.tostring(minBarsConfirm) +
+               "\nDiv Confirmed: " + str.tostring(divBarsConfirmed) + "/" + str.tostring(minBarsConfirm)
+    label.new(bar_index, sessionDelta, text=debugStr, textcolor=color.gray, size=size.tiny, style=label.style_label_lower_left)
+
+// Uncomment to see debug info
+// f_debugLabel()

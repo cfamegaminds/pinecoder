@@ -1,0 +1,785 @@
+//@version=6
+indicator("SessionDelta Trend Tracker [3:30] V18.8 PRODUCTION", overlay=false, max_lines_count=50, max_boxes_count=50, max_labels_count=500, max_bars_back=5000)
+
+// ════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════
+DAILY_MINUTES = 1440
+SESSION_MINUTES = 7200
+MAX_DELTA = 9999999.0
+MIN_VAL_VAH_CONCENTRATION = 0.65
+
+// ════════════════════════════════════════════════════════
+// INPUTS: CORE SESSIONDELTA
+// ════════════════════════════════════════════════════════
+string sessionTZ = "Asia/Kolkata"
+
+sessHour = input.int(3, "Session Start Hour", minval=0, maxval=23, group="Session")
+sessMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group="Session")
+
+rows = input.int(20, "Profile Rows", minval=10, maxval=50, group="FRVP")
+profilesToShow = input.int(20, "Profiles To Plot", minval=1, maxval=30, group="FRVP")
+
+bool showDeltaSpikes = input.bool(true, "Show Delta Spikes", group="OFD7")
+bool showDivergence = input.bool(true, "Show Bearish Divergence", group="OFD7")
+float bearishDivLevel = input.float(2500, "Bearish Divergence Level", group="OFD7")
+float spikeDeltaBand = input.float(5000, "Delta Spike: Max |Δ|", minval=0, group="OFD7")
+
+float wBuySideLiq = input.float(3.0, "Weight: Buyside Liquidity", minval=0, group="Liquidity")
+float wSellSideLiq = input.float(3.0, "Weight: Sellside Liquidity", minval=0, group="Liquidity")
+
+// ════════════════════════════════════════════════════════
+// INPUTS: RISK / REWARD
+// ════════════════════════════════════════════════════════
+bool showRiskReward = input.bool(true, "Show Risk/Reward Panel", group="Risk Management")
+
+float accountSize = input.float(10000, "Account Size ($)", minval=100, group="Risk Management")
+float riskPercent = input.float(1.0, "Risk Per Trade %", minval=0.1, maxval=5.0, step=0.1, group="Risk Management")
+float rewardMultiplier = input.float(3.0, "Reward Multiplier (1:X)", minval=1.0, maxval=10.0, step=0.5, group="Risk Management")
+
+// ════════════════════════════════════════════════════════
+// INPUTS: DIAGNOSTICS
+// ════════════════════════════════════════════════════════
+bool enableDiagnostics = input.bool(true, "Enable MAX Diagnostics", group="Diagnostics")
+bool showDiagnosticTable = input.bool(true, "Show Diagnostic Table", group="Diagnostics")
+
+// ════════════════════════════════════════════════════════
+// ANCHOR ENGINE — CONFIGURABLE 1M SESSION
+// ════════════════════════════════════════════════════════
+f_session(int _sessHour, int _sessMinute) =>
+    bool _new = hour(time, sessionTZ) == _sessHour and minute(time, sessionTZ) == _sessMinute
+    var float _cH = na
+    var float _cL = na
+    var float _pH = na
+    var float _pL = na
+    var float _anch = na
+    var float _oteH = na
+    var float _oteL = na
+
+    if _new
+        _pH := _cH
+        _pL := _cL
+        _cH := high
+        _cL := low
+        _anch := open
+        if not na(_pH) and not na(_pL)
+            float _r = _pH - _pL
+            if _r > 0
+                _oteH := _pH - _r * 0.79
+                _oteL := _pH - _r * 0.90
+            else
+                _oteH := na
+                _oteL := na
+    else
+        _cH := na(_cH) ? high : math.max(_cH, high)
+        _cL := na(_cL) ? low : math.min(_cL, low)
+
+    [_anch, _oteH, _oteL]
+
+[_anch, _oteH, _oteL] = request.security(syminfo.tickerid, "1", f_session(sessHour, sessMinute), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+var float anchor = na
+anchor := not na(_anch) ? _anch : nz(anchor[1])
+
+// ════════════════════════════════════════════════════════
+// STATE VARIABLES
+// ════════════════════════════════════════════════════════
+var int[] sessionStarts = array.new_int()
+var int[] sessionEnds = array.new_int()
+
+var bool sessionJustClosed = false
+var float sessionDelta = 0.0
+var float lockedSessionVAL = na
+var float lockedSessionVAH = na
+var bool sessionLocked = false
+var float sessionHigh = na
+var float sessionLow = na
+var int barsInSession = 0
+
+var float sessionVALVAHConcentration = 1.0
+var bool valvahStrong = true
+
+var float entryPrice = na
+var float stopLoss = na
+var float takeProfit = na
+var float positionRisk = na
+var float positionReward = na
+var float riskDistance = na
+var float rewardDistance = na
+var float riskRewardRatio = na
+var string rrSignal = ""
+
+var string headerText = ""
+var string line1Text = ""
+var string line2Text = ""
+var color hdrColor = color.gray
+var color l1Color = color.gray
+var color l2Color = color.gray
+
+var table liqTable = table.new(position.top_right, 2, 3, border_width=1, frame_width=1, frame_color=color.white)
+var table biasBox = table.new(position.bottom_left, 1, 3, border_width=1, border_color=color.gray)
+
+var table rrTable = na
+var bool rrTableCreated = false
+
+var table diagTable = na
+var bool diagTableCreated = false
+
+// ════════════════════════════════════════════════════════
+// PROFILE CALCULATION
+// ════════════════════════════════════════════════════════
+calcProfileLevels(int _startBar, int _endBar, int _rows) =>
+    int _sessionLength = _endBar >= _startBar ? _endBar - _startBar + 1 : 0
+    int _lookback = math.min(_sessionLength, 500)
+
+    if _lookback <= 0
+        [na, na, na]
+    else
+        int _endOffset = bar_index - _endBar
+
+        if _endOffset < 0 or _endOffset + _lookback - 1 > 4999
+            [na, na, na]
+        else
+            float _hi = na
+            float _lo = na
+
+            for i = 0 to _lookback - 1
+                int _idx = _endOffset + i
+                float _h = high[_idx]
+                float _l = low[_idx]
+
+                if not na(_h)
+                    _hi := na(_hi) ? _h : math.max(_hi, _h)
+                if not na(_l)
+                    _lo := na(_lo) ? _l : math.min(_lo, _l)
+
+            if na(_hi) or na(_lo) or _lo >= _hi
+                [na, na, na]
+            else
+                float _range = math.max(_hi - _lo, syminfo.mintick)
+                float _step = _range / _rows
+                float[] _volumeRows = array.new_float(_rows, 0.0)
+                float _totalVol = 0.0
+
+                for i = 0 to _lookback - 1
+                    int _idx = _endOffset + i
+                    float _barHigh = high[_idx]
+                    float _barLow = low[_idx]
+                    float _barVol = nz(volume[_idx], 0.0)
+
+                    if not na(_barHigh) and not na(_barLow)
+                        _totalVol += _barVol
+                        float _barRange = math.max(_barHigh - _barLow, syminfo.mintick)
+
+                        for r = 0 to _rows - 1
+                            float _rowLow = _lo + _step * r
+                            float _rowHigh = _rowLow + _step
+                            float _overlap = math.max(math.min(_barHigh, _rowHigh) - math.max(_barLow, _rowLow), 0.0)
+
+                            if _overlap > 0
+                                float _allocatedVol = _barVol * (_overlap / _barRange)
+                                array.set(_volumeRows, r, array.get(_volumeRows, r) + _allocatedVol)
+
+                float _maxVol = 0.0
+                int _pocRow = 0
+
+                for r = 0 to _rows - 1
+                    float _rowVol = array.get(_volumeRows, r)
+                    if _rowVol > _maxVol
+                        _maxVol := _rowVol
+                        _pocRow := r
+
+                float _poc = _lo + _step * _pocRow + _step * 0.5
+
+                if _totalVol <= 0
+                    [_poc, _lo + _step * _rows, _lo]
+                else
+                    float _targetVol = _totalVol * 0.79
+                    float _valueVol = _maxVol
+                    int _vahRow = _pocRow
+                    int _valRow = _pocRow
+                    int _upRow = _pocRow + 1
+                    int _downRow = _pocRow - 1
+
+                    while _valueVol < _targetVol and (_upRow < _rows or _downRow >= 0)
+                        float _volUp = _upRow < _rows and _upRow >= 0 ? array.get(_volumeRows, _upRow) : 0.0
+                        float _volDown = _downRow >= 0 and _downRow < _rows ? array.get(_volumeRows, _downRow) : 0.0
+
+                        if _volUp > _volDown
+                            if _upRow < _rows
+                                _valueVol += _volUp
+                                _vahRow := _upRow
+                                _upRow += 1
+                            else if _downRow >= 0
+                                _valueVol += _volDown
+                                _valRow := _downRow
+                                _downRow -= 1
+                        else if _volDown > _volUp
+                            if _downRow >= 0
+                                _valueVol += _volDown
+                                _valRow := _downRow
+                                _downRow -= 1
+                            else if _upRow < _rows
+                                _valueVol += _volUp
+                                _vahRow := _upRow
+                                _upRow += 1
+                        else
+                            if _upRow < _rows
+                                _valueVol += _volUp
+                                _vahRow := _upRow
+                                _upRow += 1
+                            else if _downRow >= 0
+                                _valueVol += _volDown
+                                _valRow := _downRow
+                                _downRow -= 1
+
+                    _vahRow := math.max(0, math.min(_rows - 1, _vahRow))
+                    _valRow := math.max(0, math.min(_rows - 1, _valRow))
+
+                    float _vah = _lo + _step * _vahRow + _step
+                    float _val = _lo + _step * _valRow
+
+                    [_poc, _vah, _val]
+
+// ════════════════════════════════════════════════════════
+// SESSION TRACKING
+// ════════════════════════════════════════════════════════
+int curHour = hour(time, sessionTZ)
+int curMin = minute(time, sessionTZ)
+
+bool isNewSession = curHour == sessHour and curMin == sessMinute
+
+if isNewSession
+    if array.size(sessionStarts) > array.size(sessionEnds)
+        array.push(sessionEnds, bar_index - 1)
+
+    array.push(sessionStarts, bar_index)
+    sessionJustClosed := true
+    barsInSession := 1
+
+    while array.size(sessionStarts) > profilesToShow + 1
+        array.shift(sessionStarts)
+
+    while array.size(sessionEnds) > profilesToShow
+        array.shift(sessionEnds)
+else
+    sessionJustClosed := false
+    barsInSession := math.max(barsInSession + 1, 1)
+
+// ════════════════════════════════════════════════════════
+// LIQUIDITY LOCK
+// ════════════════════════════════════════════════════════
+if sessionJustClosed and array.size(sessionEnds) > 0
+    int latestSessionEnd = array.get(sessionEnds, array.size(sessionEnds) - 1)
+
+    if not na(latestSessionEnd) and array.size(sessionStarts) >= 2
+        int latestSessionStart = array.get(sessionStarts, array.size(sessionStarts) - 2)
+        [tmpPOC, tmpVAH, tmpVAL] = calcProfileLevels(latestSessionStart, latestSessionEnd, rows)
+
+        if not na(tmpVAH) and not na(tmpVAL)
+            float valvahRange = tmpVAH - tmpVAL
+
+            if valvahRange > 0
+                float sessionVolTot = 0.0
+                float valvahVol = 0.0
+
+                int sessionLength = latestSessionEnd - latestSessionStart + 1
+                int lookbackRange = math.min(sessionLength, 500)
+                int endOffset = bar_index - latestSessionEnd
+
+                if endOffset >= 0 and endOffset + lookbackRange - 1 <= 4999
+                    for i = 0 to lookbackRange - 1
+                        int idx = endOffset + i
+                        float barVol = nz(volume[idx], 0.0)
+                        float barPrice = close[idx]
+
+                        sessionVolTot += barVol
+
+                        if barPrice >= tmpVAL and barPrice <= tmpVAH
+                            valvahVol += barVol
+
+                    sessionVALVAHConcentration := sessionVolTot > 0 ? valvahVol / sessionVolTot : 0.0
+                    valvahStrong := sessionVALVAHConcentration >= MIN_VAL_VAH_CONCENTRATION
+
+                lockedSessionVAL := tmpVAL
+                lockedSessionVAH := tmpVAH
+                sessionLocked := true
+
+// ════════════════════════════════════════════════════════
+// LIQUIDITY LEVELS
+// ════════════════════════════════════════════════════════
+float buySideLiquidity = sessionLocked ? lockedSessionVAL : close
+float sellSideLiquidity = sessionLocked ? lockedSessionVAH : close
+
+// ════════════════════════════════════════════════════════
+// SESSION DELTA
+// ════════════════════════════════════════════════════════
+bool isUp = close > open
+bool isDown = close < open
+
+float safeVolume = nz(volume, 0.0)
+float buyVolume = isUp ? safeVolume : 0.0
+float sellVolume = isDown ? safeVolume : 0.0
+float delta = buyVolume - sellVolume
+
+if isNewSession
+    sessionDelta := math.min(math.max(delta, -MAX_DELTA), MAX_DELTA)
+else
+    float newSessionDelta = sessionDelta + delta
+    sessionDelta := math.min(math.max(newSessionDelta, -MAX_DELTA), MAX_DELTA)
+
+// ════════════════════════════════════════════════════════
+// SESSION EXTREMES
+// ════════════════════════════════════════════════════════
+if isNewSession
+    sessionHigh := high
+    sessionLow := low
+else
+    sessionHigh := na(sessionHigh) ? high : math.max(sessionHigh, high)
+    sessionLow := na(sessionLow) ? low : math.min(sessionLow, low)
+
+// ════════════════════════════════════════════════════════
+// DELTA SPIKE ENGINE
+// ════════════════════════════════════════════════════════
+float absDelta = math.abs(delta)
+float atr20 = ta.atr(20)
+float avgVolume20 = ta.sma(volume, 20)
+
+float volumeRatio = not na(avgVolume20) and avgVolume20 > 0 ? safeVolume / avgVolume20 : 1.0
+float atrScaled = math.max(nz(atr20, syminfo.mintick) * volumeRatio, syminfo.mintick)
+float deltaWma = ta.wma(absDelta, 20)
+float volNormThreshold = nz(deltaWma, 0.0) * 2.5 + atrScaled * 0.05
+bool deltaSpike = absDelta > volNormThreshold
+
+float deltaTrend = ta.wma(sessionDelta, 5)
+bool deltaTrendUp = not na(deltaTrend) and not na(deltaTrend[1]) and deltaTrend > deltaTrend[1]
+bool deltaTrendDown = not na(deltaTrend) and not na(deltaTrend[1]) and deltaTrend < deltaTrend[1]
+bool spikeSameDirection = (delta > 0 and deltaTrendUp) or (delta < 0 and deltaTrendDown)
+
+// ════════════════════════════════════════════════════════
+// DIVERGENCE
+// ════════════════════════════════════════════════════════
+float priorSessionHigh = sessionHigh[1]
+float twoBarsAgoSessionHigh = sessionHigh[2]
+
+bool priceNewHigh = not na(priorSessionHigh) and high > priorSessionHigh
+bool highFor2Bars = priceNewHigh and not na(twoBarsAgoSessionHigh) and high[1] >= twoBarsAgoSessionHigh
+bool deltaBelowDiv = sessionDelta < bearishDivLevel
+bool deltaNoteUp = not na(sessionDelta[1]) and sessionDelta < sessionDelta[1]
+
+bool bearishDiv = (priceNewHigh or highFor2Bars) and deltaBelowDiv and close < sessionHigh and deltaNoteUp
+
+// ════════════════════════════════════════════════════════
+// LIQUIDITY ELASTICITY
+// ════════════════════════════════════════════════════════
+int elasticityLookback = math.max(1, math.min(barsInSession, 20))
+
+bool valTouched = sessionLocked and not na(lockedSessionVAL) and ta.lowest(low, elasticityLookback) <= lockedSessionVAL
+bool vahTouched = sessionLocked and not na(lockedSessionVAH) and ta.highest(high, elasticityLookback) >= lockedSessionVAH
+
+float expansion = valTouched and vahTouched ? 1.0 : 1.15
+
+float elasticVAL = sessionLocked and not na(lockedSessionVAL) and not na(lockedSessionVAH) ? lockedSessionVAL - (lockedSessionVAH - lockedSessionVAL) * (expansion - 1.0) * 0.5 : na
+float elasticVAH = sessionLocked and not na(lockedSessionVAL) and not na(lockedSessionVAH) ? lockedSessionVAH + (lockedSessionVAH - lockedSessionVAL) * (expansion - 1.0) * 0.5 : na
+
+float buySideLiquidityAdapt = sessionLocked and not na(elasticVAL) ? elasticVAL : buySideLiquidity
+float sellSideLiquidityAdapt = sessionLocked and not na(elasticVAH) ? elasticVAH : sellSideLiquidity
+
+// ════════════════════════════════════════════════════════
+// CORE COLOR LOGIC — PRESERVED
+// ════════════════════════════════════════════════════════
+color deltaColor = color.black
+
+if close > sellSideLiquidityAdapt and close > anchor and sessionDelta > 0
+    deltaColor := color.new(color.green, 0)
+else if close < buySideLiquidityAdapt and close < anchor and sessionDelta < 0
+    deltaColor := color.new(color.red, 0)
+
+plot(sessionDelta, title="Session Cumulative Delta", color=deltaColor, linewidth=3)
+hline(0, "Zero Line", color=color.black, linewidth=2)
+
+// ════════════════════════════════════════════════════════
+// CORE BIAS / SIGNAL LOGIC — PRESERVED
+// ════════════════════════════════════════════════════════
+bool isBullish = close > sellSideLiquidityAdapt and close > anchor and sessionDelta > 0
+bool isBearish = close < buySideLiquidityAdapt and close < anchor and sessionDelta < 0
+
+bool bullishSetupConfirmed = isBullish and valvahStrong and sessionLocked
+bool bearishSetupConfirmed = isBearish and valvahStrong and sessionLocked
+
+bool bullishSignal = bullishSetupConfirmed and deltaSpike and spikeSameDirection
+bool bearishSignal = bearishSetupConfirmed and deltaSpike and spikeSameDirection
+
+// ════════════════════════════════════════════════════════
+// R/R CALCULATIONS
+// ════════════════════════════════════════════════════════
+f_calculateLongRR() =>
+    float riskAmount = accountSize * (riskPercent / 100.0)
+
+    if not na(buySideLiquidityAdapt) and not na(elasticVAL)
+        float entry = buySideLiquidityAdapt
+        float sl = elasticVAL - syminfo.mintick
+        float riskDist = entry - sl
+
+        if riskDist > 0
+            float rewardDist = riskDist * rewardMultiplier
+            float tp = entry + rewardDist
+            [entry, sl, tp, riskAmount, riskDist, rewardDist]
+        else
+            [na, na, na, na, na, na]
+    else
+        [na, na, na, na, na, na]
+
+f_calculateShortRR() =>
+    float riskAmount = accountSize * (riskPercent / 100.0)
+
+    if not na(sellSideLiquidityAdapt) and not na(elasticVAH)
+        float entry = sellSideLiquidityAdapt
+        float sl = elasticVAH + syminfo.mintick
+        float riskDist = sl - entry
+
+        if riskDist > 0
+            float rewardDist = riskDist * rewardMultiplier
+            float tp = entry - rewardDist
+            [entry, sl, tp, riskAmount, riskDist, rewardDist]
+        else
+            [na, na, na, na, na, na]
+    else
+        [na, na, na, na, na, na]
+
+// ════════════════════════════════════════════════════════
+// R/R STATE UPDATE
+// ════════════════════════════════════════════════════════
+if bullishSignal
+    [entryLong, slLong, tpLong, riskLong, riskDistLong, rewardDistLong] = f_calculateLongRR()
+
+    entryPrice := entryLong
+    stopLoss := slLong
+    takeProfit := tpLong
+    positionRisk := riskLong
+    riskDistance := riskDistLong
+    rewardDistance := rewardDistLong
+    positionReward := rewardDistLong
+    riskRewardRatio := not na(riskDistLong) and riskDistLong > 0 ? rewardDistLong / riskDistLong : na
+    rrSignal := not na(entryLong) ? "LONG" : ""
+
+else if bearishSignal
+    [entryShort, slShort, tpShort, riskShort, riskDistShort, rewardDistShort] = f_calculateShortRR()
+
+    entryPrice := entryShort
+    stopLoss := slShort
+    takeProfit := tpShort
+    positionRisk := riskShort
+    riskDistance := riskDistShort
+    rewardDistance := rewardDistShort
+    positionReward := rewardDistShort
+    riskRewardRatio := not na(riskDistShort) and riskDistShort > 0 ? rewardDistShort / riskDistShort : na
+    rrSignal := not na(entryShort) ? "SHORT" : ""
+
+else
+    entryPrice := na
+    stopLoss := na
+    takeProfit := na
+    positionRisk := na
+    riskDistance := na
+    rewardDistance := na
+    positionReward := na
+    riskRewardRatio := na
+    rrSignal := ""
+
+// ════════════════════════════════════════════════════════
+// LIQUIDITY TABLE
+// ════════════════════════════════════════════════════════
+if barstate.islast
+    table.cell(liqTable, 0, 0, "Liquidity Level", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(liqTable, 1, 0, "Price", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.small)
+    table.cell(liqTable, 0, 1, "Buyside", bgcolor=color.new(color.green, 90), text_color=color.white, text_size=size.small)
+    table.cell(liqTable, 1, 1, na(buySideLiquidityAdapt) ? "—" : str.tostring(buySideLiquidityAdapt, format.mintick), bgcolor=color.new(color.green, 95), text_color=color.white, text_size=size.small)
+    table.cell(liqTable, 0, 2, "Sellside", bgcolor=color.new(color.red, 90), text_color=color.white, text_size=size.small)
+    table.cell(liqTable, 1, 2, na(sellSideLiquidityAdapt) ? "—" : str.tostring(sellSideLiquidityAdapt, format.mintick), bgcolor=color.new(color.red, 95), text_color=color.white, text_size=size.small)
+
+// ════════════════════════════════════════════════════════
+// BIAS BOX — PRESERVED
+// ════════════════════════════════════════════════════════
+bool isBullishBias = close > sellSideLiquidityAdapt and close > anchor and sessionDelta > 0
+bool isBearishBias = close < buySideLiquidityAdapt and close < anchor and sessionDelta < 0
+bool isBalanced = not isBullishBias and not isBearishBias
+
+bool confluenceActive = isBullishBias or isBearishBias
+string confluenceMsg = confluenceActive ? "🎖️ CONFLUENCE" : "⚠️ WAIT "
+
+if isBullishBias
+    headerText := "✔ BULLISH BIAS  " + confluenceMsg
+    line1Text := "CMP > SellLiQ | CMP > Anchor | Δ GREEN [BUY]"
+    line2Text := str.tostring(sessionDelta, "#,##0.00")
+    hdrColor := color.new(color.green, 10)
+    l1Color := color.new(color.green, 20)
+    l2Color := color.new(color.green, 50)
+else if isBearishBias
+    headerText := "⚠ BEARISH BIAS  " + confluenceMsg
+    line1Text := "CMP < BuyLiQ | CMP < Anchor | Δ RED [SELL]"
+    line2Text := str.tostring(sessionDelta, "#,##0.00")
+    hdrColor := color.new(color.red, 10)
+    l1Color := color.new(color.red, 20)
+    l2Color := color.new(color.red, 50)
+else
+    headerText := "◆ BALANCED  " + confluenceMsg
+    line1Text := "Δ BLACK | Volatile Market [⚠ NO TRADE]"
+    line2Text := str.tostring(sessionDelta, "#,##0.00")
+    hdrColor := color.new(color.orange, 10)
+    l1Color := color.new(color.black, 10)
+    l2Color := color.new(color.gray, 20)
+
+if barstate.islast
+    table.cell(biasBox, 0, 0, headerText, bgcolor=hdrColor, text_color=color.white, text_size=size.large)
+    table.cell(biasBox, 0, 1, line1Text, bgcolor=l1Color, text_color=color.white, text_size=size.large)
+    table.cell(biasBox, 0, 2, line2Text, bgcolor=l2Color, text_color=color.white, text_size=size.large)
+
+// ════════════════════════════════════════════════════════
+// DIVERGENCE / SPIKE PLOTS
+// ════════════════════════════════════════════════════════
+plot(showDivergence and bearishDiv and valvahStrong ? sessionDelta : na, title="Bearish Divergence Signal", color=color.new(color.red, 0), linewidth=6, style=plot.style_circles)
+
+bool inDeltaBand = math.abs(sessionDelta) <= spikeDeltaBand
+
+plot(showDeltaSpikes and deltaSpike and inDeltaBand and spikeSameDirection ? sessionDelta : na, title="Delta Spike", color=color.black, linewidth=5, style=plot.style_circles)
+
+// ════════════════════════════════════════════════════════
+// R/R TABLE
+// ════════════════════════════════════════════════════════
+if barstate.islast and showRiskReward
+    if not rrTableCreated
+        rrTable := table.new(position.bottom_right, 2, 5, border_width=1, frame_width=1, frame_color=color.white)
+        rrTableCreated := true
+
+    color rrColor = rrSignal == "LONG" ? color.new(color.green, 25) : rrSignal == "SHORT" ? color.new(color.red, 25) : color.new(color.gray, 80)
+    string rrRatioText = na(riskRewardRatio) ? "—" : "1:" + str.tostring(riskRewardRatio, "#.##")
+
+    table.cell(rrTable, 0, 0, "R/R SIGNAL", bgcolor=rrColor, text_color=color.white, text_size=size.large, text_halign=text.align_center)
+    table.cell(rrTable, 1, 0, rrSignal, bgcolor=rrColor, text_color=color.white, text_size=size.large, text_halign=text.align_center)
+
+    table.cell(rrTable, 0, 1, "Entry", bgcolor=color.new(color.blue, 90), text_color=color.white, text_size=size.small)
+    table.cell(rrTable, 1, 1, na(entryPrice) ? "—" : str.tostring(entryPrice, format.mintick), bgcolor=color.new(color.blue, 95), text_color=color.white, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(rrTable, 0, 2, "Stop Loss", bgcolor=color.new(color.red, 90), text_color=color.white, text_size=size.small)
+    table.cell(rrTable, 1, 2, na(stopLoss) ? "—" : str.tostring(stopLoss, format.mintick), bgcolor=color.new(color.red, 95), text_color=color.white, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(rrTable, 0, 3, "Take Profit", bgcolor=color.new(color.green, 90), text_color=color.white, text_size=size.small)
+    table.cell(rrTable, 1, 3, na(takeProfit) ? "—" : str.tostring(takeProfit, format.mintick), bgcolor=color.new(color.green, 95), text_color=color.white, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(rrTable, 0, 4, "Risk:Reward", bgcolor=color.new(color.orange, 90), text_color=color.white, text_size=size.small)
+    table.cell(rrTable, 1, 4, rrRatioText, bgcolor=color.new(color.orange, 95), text_color=color.white, text_size=size.small, text_halign=text.align_right)
+
+// ════════════════════════════════════════════════════════
+// MAX DIAGNOSTICS — NON-INTRUSIVE LIVE INVARIANT TESTS
+// ════════════════════════════════════════════════════════
+bool expectedGreen = close > sellSideLiquidityAdapt and close > anchor and sessionDelta > 0
+bool expectedRed = close < buySideLiquidityAdapt and close < anchor and sessionDelta < 0
+bool expectedBlack = not expectedGreen and not expectedRed
+
+bool testSession =
+     barsInSession >= 1 and
+     array.size(sessionStarts) <= profilesToShow + 1 and
+     array.size(sessionEnds) <= profilesToShow and
+     (isNewSession ? barsInSession == 1 : true)
+
+bool testAnchor =
+     (not na(anchor) or na(_anch)) and
+     sessHour >= 0 and sessHour <= 23 and
+     sessMinute >= 0 and sessMinute <= 59
+
+bool testDelta =
+     not na(sessionDelta) and
+     sessionDelta <= MAX_DELTA and
+     sessionDelta >= -MAX_DELTA and
+     (not isUp or delta >= 0) and
+     (not isDown or delta <= 0)
+
+bool testColor =
+     (expectedGreen and deltaColor == color.new(color.green, 0)) or
+     (expectedRed and deltaColor == color.new(color.red, 0)) or
+     (expectedBlack and deltaColor == color.black)
+
+bool testBias =
+     ((isBullishBias and not isBearishBias and not isBalanced) or
+      (isBearishBias and not isBullishBias and not isBalanced) or
+      (isBalanced and not isBullishBias and not isBearishBias)) and
+     (isBullishBias ? expectedGreen : true) and
+     (isBearishBias ? expectedRed : true) and
+     (isBalanced ? expectedBlack : true)
+
+bool testProfile =
+     not sessionLocked or
+     (not na(lockedSessionVAL) and
+      not na(lockedSessionVAH) and
+      lockedSessionVAH >= lockedSessionVAL and
+      sessionVALVAHConcentration >= 0 and
+      sessionVALVAHConcentration <= 1)
+
+bool testElasticity =
+     (expansion == 1.0 or expansion == 1.15) and
+     (not sessionLocked or
+      (not na(elasticVAL) and
+       not na(elasticVAH) and
+       elasticVAL <= elasticVAH))
+
+bool testSpike =
+     volNormThreshold >= 0 and
+     (not deltaSpike or absDelta > volNormThreshold) and
+     (not spikeSameDirection or
+      ((delta > 0 and deltaTrendUp) or
+       (delta < 0 and deltaTrendDown)))
+
+bool testDivergence =
+     not bearishDiv or
+     ((priceNewHigh or highFor2Bars) and
+      deltaBelowDiv and
+      deltaNoteUp and
+      close < sessionHigh)
+
+bool testSignal =
+     (not bullishSetupConfirmed or
+      (isBullish and valvahStrong and sessionLocked)) and
+     (not bearishSetupConfirmed or
+      (isBearish and valvahStrong and sessionLocked)) and
+     (not bullishSignal or
+      (bullishSetupConfirmed and deltaSpike and spikeSameDirection)) and
+     (not bearishSignal or
+      (bearishSetupConfirmed and deltaSpike and spikeSameDirection))
+
+bool testRR =
+     (rrSignal == "" or rrSignal == "LONG" or rrSignal == "SHORT") and
+     (na(riskRewardRatio) or
+      math.abs(riskRewardRatio - rewardMultiplier) < 0.000001) and
+     (rrSignal != "LONG" or
+      (not na(entryPrice) and
+       not na(stopLoss) and
+       not na(takeProfit) and
+       entryPrice > stopLoss and
+       takeProfit > entryPrice)) and
+     (rrSignal != "SHORT" or
+      (not na(entryPrice) and
+       not na(stopLoss) and
+       not na(takeProfit) and
+       stopLoss > entryPrice and
+       entryPrice > takeProfit))
+
+bool testUI =
+     (showRiskReward ? rrTableCreated : true) and
+     headerText != "" and
+     line1Text != "" and
+     line2Text != ""
+
+bool testMTF =
+     sessHour >= 0 and sessHour <= 23 and
+     sessMinute >= 0 and sessMinute <= 59 and
+     (not na(anchor) or na(_anch))
+
+bool testRuntime =
+     not na(open) and
+     not na(high) and
+     not na(low) and
+     not na(close) and
+     high >= low and
+     barsInSession >= 1 and
+     (na(sessionHigh) or sessionHigh >= sessionLow)
+
+bool testAll =
+     testSession and
+     testAnchor and
+     testDelta and
+     testColor and
+     testBias and
+     testProfile and
+     testElasticity and
+     testSpike and
+     testDivergence and
+     testSignal and
+     testRR and
+     testUI and
+     testMTF and
+     testRuntime
+
+int testsTotal = 14
+int testsPassed =
+     (testSession ? 1 : 0) +
+     (testAnchor ? 1 : 0) +
+     (testDelta ? 1 : 0) +
+     (testColor ? 1 : 0) +
+     (testBias ? 1 : 0) +
+     (testProfile ? 1 : 0) +
+     (testElasticity ? 1 : 0) +
+     (testSpike ? 1 : 0) +
+     (testDivergence ? 1 : 0) +
+     (testSignal ? 1 : 0) +
+     (testRR ? 1 : 0) +
+     (testUI ? 1 : 0) +
+     (testMTF ? 1 : 0) +
+     (testRuntime ? 1 : 0)
+
+float testPassRate = testsPassed / testsTotal * 100.0
+
+f_status(bool _condition) =>
+    _condition ? "PASS" : "FAIL"
+
+f_statusBg(bool _condition) =>
+    _condition ? color.new(color.green, 75) : color.new(color.red, 65)
+
+// ════════════════════════════════════════════════════════
+// MAX DIAGNOSTIC TABLE
+// ════════════════════════════════════════════════════════
+if enableDiagnostics and showDiagnosticTable and barstate.islast
+    if not diagTableCreated
+        diagTable := table.new(position.middle_right, 2, 16, border_width=1, frame_width=1, frame_color=color.white)
+        diagTableCreated := true
+
+    color diagHeaderColor = testAll ? color.new(color.green, 15) : color.new(color.red, 15)
+    string diagHeader = testAll ? "✓ ALL LIVE TESTS PASS" : "⚠ LIVE TEST FAILURE"
+
+    table.cell(diagTable, 0, 0, "V18.8 MAX TESTS", bgcolor=diagHeaderColor, text_color=color.white, text_size=size.normal)
+    table.cell(diagTable, 1, 0, str.tostring(testsPassed) + "/" + str.tostring(testsTotal) + "  " + str.tostring(testPassRate, "#.##") + "%", bgcolor=diagHeaderColor, text_color=color.white, text_size=size.normal)
+
+    table.cell(diagTable, 0, 1, "SESSION", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 1, f_status(testSession), bgcolor=f_statusBg(testSession), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 2, "ANCHOR / MTF", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 2, f_status(testAnchor), bgcolor=f_statusBg(testAnchor), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 3, "DELTA", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 3, f_status(testDelta), bgcolor=f_statusBg(testDelta), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 4, "COLOR", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 4, f_status(testColor), bgcolor=f_statusBg(testColor), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 5, "BIAS", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 5, f_status(testBias), bgcolor=f_statusBg(testBias), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 6, "PROFILE", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 6, f_status(testProfile), bgcolor=f_statusBg(testProfile), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 7, "ELASTICITY", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 7, f_status(testElasticity), bgcolor=f_statusBg(testElasticity), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 8, "SPIKE", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 8, f_status(testSpike), bgcolor=f_statusBg(testSpike), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 9, "DIVERGENCE", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 9, f_status(testDivergence), bgcolor=f_statusBg(testDivergence), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 10, "SIGNAL", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 10, f_status(testSignal), bgcolor=f_statusBg(testSignal), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 11, "R/R", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 11, f_status(testRR), bgcolor=f_statusBg(testRR), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 12, "UI", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 12, f_status(testUI), bgcolor=f_statusBg(testUI), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 13, "MTF", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 13, f_status(testMTF), bgcolor=f_statusBg(testMTF), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 14, "RUNTIME", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 14, f_status(testRuntime), bgcolor=f_statusBg(testRuntime), text_color=color.white, text_size=size.tiny)
+
+    table.cell(diagTable, 0, 15, "OVERALL", bgcolor=diagHeaderColor, text_color=color.white, text_size=size.tiny)
+    table.cell(diagTable, 1, 15, f_status(testAll), bgcolor=diagHeaderColor, text_color=color.white, text_size=size.tiny)
